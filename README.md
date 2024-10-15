@@ -211,6 +211,4 @@ This project is licensed under the terms of the MIT license.
 
 For questions or comments, please open an issue on this repository or contact us at cyd0806@mail.ustc.edu.cn.
 
----
 
-**Note**: Replace `https://github.com/your_username/CLC.git` with the actual URL of your repository, and update `arXiv:XXXX.XXXXX` in the citation with the correct identifier once available.
