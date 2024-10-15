@@ -201,7 +201,7 @@ If you find this code useful in your research, please consider citing:
 
 ## Acknowledgements
 
-This code is built upon [CompressAI](https://github.com/InterDigitalInc/CompressAI) and the [TCM framework](https://github.com/ZhengxueCheng/Transfromer-Coding). We thank the authors for their contributions to the community.
+This code is built upon [CompressAI](https://github.com/InterDigitalInc/CompressAI) and the [TCM framework](https://github.com/jmliu206/LIC_TCM). We thank the authors for their contributions to the community.
 
 ## License
 
