@@ -38,7 +38,7 @@ In this repository, we provide the code for:
 1. **Clone the repository**:
 
    ```bash
-   git clone https://github.com/your_username/CLC.git
+   git clone https://github.com/ydchen0806/CLC.git
    cd CLC
    ```
 
