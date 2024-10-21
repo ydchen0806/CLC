@@ -8,13 +8,13 @@ import torch.nn as nn
 import torch.optim as optim
 
 from torch.utils.data import DataLoader
-from dataloader_CLC import LICDataset
+from dataloader_ref_cluster import LICDataset
 from torchvision import transforms
 
 from compressai.datasets import ImageFolder
 from compressai.zoo import models
 from pytorch_msssim import ms_ssim
-
+import torch.multiprocessing as mp
 from models import TCM, CLC
 from torch.utils.tensorboard import SummaryWriter   
 import os
@@ -214,7 +214,7 @@ def parse_args(argv):
     parser.add_argument(
         "-m",
         "--model",
-        default="tcm",
+        default="clc",
         choices=["tcm", "clc"],
         help="Model architecture (default: %(default)s)",
     )
@@ -411,6 +411,7 @@ def main(argv):
         )
         loss = test_epoch(epoch, test_dataloader, net, criterion, type)
         writer.add_scalar('test_loss', loss, epoch)
+        # writer.add_scalar('aux loss', net.aux_loss(), epoch)
         lr_scheduler.step()
 
         is_best = loss < best_loss
@@ -433,4 +434,5 @@ def main(argv):
             )
 
 if __name__ == "__main__":
+    mp.set_start_method("spawn", force=True)
     main(sys.argv[1:])

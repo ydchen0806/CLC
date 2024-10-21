@@ -135,14 +135,21 @@ class LICDataset(torch.utils.data.Dataset):
         return self.len
     
     def __getitem__(self, idx):
+        # 获取样本 key
         key = self.keys[idx]
         sample = self.get_data(key)
+        if len(sample.shape) == 2:
+            sample = np.stack([sample] * 3, axis=-1)
+        elif sample.shape[2] == 1:
+            sample = np.concatenate([sample] * 3, axis=-1)
         
+        # 提取样本特征
         sample_feature = self.extract_feature(sample)
-        
+
+        # 最近邻搜索匹配参考样本的 key
         _, indices = self.nn_searcher.kneighbors(sample_feature.reshape(1, -1))
         ref_keys = [self.feature_to_key[i] for i in indices[0]]
-        
+
         ref_samples = []
         for ref_key in ref_keys:
             if isinstance(self.ref_data, dict):
@@ -151,8 +158,28 @@ class LICDataset(torch.utils.data.Dataset):
             else:
                 ref_sample = self.ref_data[ref_key][()]
             ref_samples.append(ref_sample)
-        
+
+        # 将 sample 转换为 torch.Tensor 并归一化
+        sample = self.normalize_to_tensor(sample)
+
+        # 对 ref_samples 列表中的每个参考样本进行转换和归一化
+        ref_samples = [self.normalize_to_tensor(ref_sample) for ref_sample in ref_samples]
+
         return sample, ref_samples, key, ref_keys
+
+    def normalize_to_tensor(self, img):
+        """
+        将一个 numpy 数组 (uint8) 转换为 torch.Tensor 并归一化到 [0, 1] 范围。
+        :param img: numpy array, uint8 格式的图像数组，值范围为 [0, 255]
+        :return: torch.Tensor, float32 类型，值范围为 [0, 1]
+        """
+        # 如果 img 是 numpy 数组，确保它的类型为 uint8
+        if isinstance(img, np.ndarray):
+            tensor = torch.tensor(img, dtype=torch.float32) / 255.0
+            tensor = tensor.permute(2, 0, 1)
+            return tensor
+        else:
+            raise ValueError("Input image should be a numpy array.")
 
     def _get_data(self, key):
         if not hasattr(self.local, 'data'):
@@ -195,11 +222,24 @@ class LICDataset(torch.utils.data.Dataset):
 
     def extract_feature(self, img):
         with torch.no_grad():
+            # 如果 img 不是一个 Tensor，则将其转换为 PIL.Image
             if not isinstance(img, torch.Tensor):
                 img = Image.fromarray(np.uint8(img))
+
+                # 检查图像的模式，如果是灰度图（L 模式），则转换为 3 通道
+                if img.mode == 'L':  # 'L' 表示灰度图
+                    img = img.convert('RGB')  # 将灰度图转换成 3 通道的 RGB 图像
+
+                # 应用 transform 进行数据预处理
                 img = self.transform(img)
+
+            # 将图像转换为 4D Tensor（用于批处理），并移动到指定设备
             img_tensor = img.unsqueeze(0).to(self.device)
+
+            # 使用特征提取器提取特征
             feature = self.feature_extractor(img_tensor)
+
+        # 返回特征，去除 batch 维度并转换为 CPU 上的 numpy 数组
         return feature.squeeze().cpu().numpy()
 
     def visualize_comparison(self, idx, save_path):
