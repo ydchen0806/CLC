@@ -5,13 +5,14 @@ python3 train_CLC.py \
     --save_path /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/trained_model_1021 \ 
     --lambda 0.01 \
     --epochs 50 \
-    --batch-size 8 \
+    --batch-size 16 \
     --learning-rate 1e-4 \
     --n_refs 3 \
     --n_clusters 1000 \
     --type mse \
     --patch-size 256 256 \
     --cuda \
+    --use-mixed-precision \
     --num-workers 0
 
 
