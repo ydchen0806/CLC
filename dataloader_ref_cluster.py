@@ -230,8 +230,8 @@ class LICDataset(torch.utils.data.Dataset):
                 if img.mode == 'L':  # 'L' 表示灰度图
                     img = img.convert('RGB')  # 将灰度图转换成 3 通道的 RGB 图像
 
-                # 应用 transform 进行数据预处理
-                img = self.transform(img)
+            # 应用 transform 进行数据预处理
+            img = self.transform(img)
 
             # 将图像转换为 4D Tensor（用于批处理），并移动到指定设备
             img_tensor = img.unsqueeze(0).to(self.device)
