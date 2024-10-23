@@ -138,11 +138,13 @@ class LICDataset(torch.utils.data.Dataset):
         # 获取样本 key
         key = self.keys[idx]
         sample = self.get_data(key)
+
+        # 如果样本是灰度图或单通道图像，扩展为三通道
         if len(sample.shape) == 2:
             sample = np.stack([sample] * 3, axis=-1)
         elif sample.shape[2] == 1:
             sample = np.concatenate([sample] * 3, axis=-1)
-        
+
         # 提取样本特征
         sample_feature = self.extract_feature(sample)
 
@@ -157,13 +159,22 @@ class LICDataset(torch.utils.data.Dataset):
                     ref_sample = np.array(img)
             else:
                 ref_sample = self.ref_data[ref_key][()]
+
+            # 如果参考样本是灰度图或单通道图像，扩展为三通道
+            if len(ref_sample.shape) == 2:
+                ref_sample = np.stack([ref_sample] * 3, axis=-1)
+            elif ref_sample.shape[2] == 1:
+                ref_sample = np.concatenate([ref_sample] * 3, axis=-1)
+
+            # 将 ref_sample 添加到列表中，稍后进行 transform
             ref_samples.append(ref_sample)
 
-        # 将 sample 转换为 torch.Tensor 并归一化
-        sample = self.normalize_to_tensor(sample)
+        # 现在对 sample 和 ref_samples 应用 transform：
+        sample = Image.fromarray(np.uint8(sample))  # 转换为 PIL 图像
+        sample = self.transform(sample)  # 应用 transform
 
-        # 对 ref_samples 列表中的每个参考样本进行转换和归一化
-        ref_samples = [self.normalize_to_tensor(ref_sample) for ref_sample in ref_samples]
+        # 对所有参考样本进行 transform
+        ref_samples = [self.transform(Image.fromarray(np.uint8(ref_sample))) for ref_sample in ref_samples]
 
         return sample, ref_samples, key, ref_keys
 
