@@ -8,6 +8,8 @@ This repository provides the official PyTorch implementation of the paper:
 > † Equal contribution
 
 ![The pipeline of our proposed methods](fig/clc1.png)
+![The pipeline of our proposed methods](fig/clc3.png)
+
 
 ## Introduction
 
