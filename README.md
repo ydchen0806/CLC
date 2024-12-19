@@ -199,7 +199,7 @@ If you find this code useful in your research, please consider citing:
   title={Conditional Latent Coding with Learnable Synthesized Reference for Deep Image Compression},
   author={Wu, Siqi and Chen, Yinda and Liu, Dong and He, Zhihai},
   journal={arXiv preprint arXiv:XXXX.XXXXX},
-  year={2023}
+  year={2025}
 }
 ```
 
