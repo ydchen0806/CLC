@@ -2,23 +2,35 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from compressai.models import CompressionModel
+from compressai.ans import BufferedRansEncoder, RansDecoder
 from compressai.entropy_models import EntropyBottleneck, GaussianConditional
-from compressai.layers import ResidualBlock, ResidualBlockWithStride, ResidualBlockUpsample, conv3x3, subpel_conv3x3
 from einops import rearrange
 from einops.layers.torch import Rearrange
 from timm.models.layers import trunc_normal_, DropPath
 import torchvision.models as models
+import sys
+sys.path.append('/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/models')
+# from CLM import CLM
+from CLM import SimpleCLM as CLM
 import math
 from torch import Tensor
+from compressai.layers import (
+    AttentionBlock,
+    ResidualBlock,
+    ResidualBlockUpsample,
+    ResidualBlockWithStride,
+    conv3x3,
+    subpel_conv3x3,
+)
 import numpy as np
 import os
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
 SCALES_MIN = 0.11
 SCALES_MAX = 256
 SCALES_LEVELS = 64
-
 def conv1x1(in_ch: int, out_ch: int, stride: int = 1) -> nn.Module:
     """1x1 convolution."""
     return nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride)
@@ -91,13 +103,6 @@ def update_registered_buffers(
 ):
     """Update the registered buffers in a module according to the tensors sized
     in a state_dict.
-
-    (There's no way in torch to directly load a buffer with a dynamic size)
-
-    Args:
-        module (nn.Module): the module
-        module_name (str): module name in the state dict
-        buffer_names (list(str)): list of the buffer names to resize in the module
         state_dict (dict): the state dict
         policy (str): Update policy, choose from
             ('resize_if_empty', 'resize', 'register')
@@ -130,25 +135,54 @@ def conv(in_channels, out_channels, kernel_size=5, stride=2):
     )
 
 class WMSA(nn.Module):
+    """ Self-attention module in Swin Transformer
+    """
+
     def __init__(self, input_dim, output_dim, head_dim, window_size, type):
         super(WMSA, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
         self.head_dim = head_dim 
         self.scale = self.head_dim ** -0.5
-        self.n_heads = input_dim // head_dim
+        self.n_heads = input_dim//head_dim
         self.window_size = window_size
-        self.type = type
+        self.type=type
         self.embedding_layer = nn.Linear(self.input_dim, 3*self.input_dim, bias=True)
         self.relative_position_params = nn.Parameter(torch.zeros((2 * window_size - 1)*(2 * window_size -1), self.n_heads))
+
         self.linear = nn.Linear(self.input_dim, self.output_dim)
 
         trunc_normal_(self.relative_position_params, std=.02)
         self.relative_position_params = torch.nn.Parameter(self.relative_position_params.view(2*window_size-1, 2*window_size-1, self.n_heads).transpose(1,2).transpose(0,1))
 
+    def generate_mask(self, h, w, p, shift):
+        """ generating the mask of SW-MSA
+        Args:
+            shift: shift parameters in CyclicShift.
+        Returns:
+            attn_mask: should be (1 1 w p p),
+        """
+        attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
+        if self.type == 'W':
+            return attn_mask
+
+        s = p - shift
+        attn_mask[-1, :, :s, :, s:, :] = True
+        attn_mask[-1, :, s:, :, :s, :] = True
+        attn_mask[:, -1, :, :s, :, s:] = True
+        attn_mask[:, -1, :, s:, :, :s] = True
+        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
+        return attn_mask
+
     def forward(self, x):
-        if self.type != 'W': 
-            x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
+        """ Forward pass of Window Multi-head Self-attention module.
+        Args:
+            x: input tensor with shape of [b h w c];
+            attn_mask: attention mask, fill -inf where the value is True; 
+        Returns:
+            output: tensor shape [b h w c]
+        """
+        if self.type!='W': x = torch.roll(x, shifts=(-(self.window_size//2), -(self.window_size//2)), dims=(1,2))
         x = rearrange(x, 'b (w1 p1) (w2 p2) c -> b w1 w2 p1 p2 c', p1=self.window_size, p2=self.window_size)
         h_windows = x.size(1)
         w_windows = x.size(2)
@@ -167,30 +201,18 @@ class WMSA(nn.Module):
         output = self.linear(output)
         output = rearrange(output, 'b (w1 w2) (p1 p2) c -> b (w1 p1) (w2 p2) c', w1=h_windows, p1=self.window_size)
 
-        if self.type != 'W': 
-            output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
+        if self.type!='W': output = torch.roll(output, shifts=(self.window_size//2, self.window_size//2), dims=(1,2))
         return output
 
     def relative_embedding(self):
-        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]), device=self.relative_position_params.device)
-        relation = cord[:, None, :] - cord[None, :, :] + self.window_size - 1
+        cord = torch.tensor(np.array([[i, j] for i in range(self.window_size) for j in range(self.window_size)]))
+        relation = cord[:, None, :] - cord[None, :, :] + self.window_size -1
         return self.relative_position_params[:, relation[:,:,0].long(), relation[:,:,1].long()]
-
-    def generate_mask(self, h, w, p, shift):
-        attn_mask = torch.zeros(h, w, p, p, p, p, dtype=torch.bool, device=self.relative_position_params.device)
-        if self.type == 'W':
-            return attn_mask
-
-        s = p - shift
-        attn_mask[-1, :, :s, :, s:, :] = True
-        attn_mask[-1, :, s:, :, :s, :] = True
-        attn_mask[:, -1, :, :s, :, s:] = True
-        attn_mask[:, -1, :, s:, :, :s] = True
-        attn_mask = rearrange(attn_mask, 'w1 w2 p1 p2 p3 p4 -> 1 1 (w1 w2) (p1 p2) (p3 p4)')
-        return attn_mask
 
 class Block(nn.Module):
     def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, type='W', input_resolution=None):
+        """ SwinTransformer Block
+        """
         super(Block, self).__init__()
         self.input_dim = input_dim
         self.output_dim = output_dim
@@ -213,254 +235,226 @@ class Block(nn.Module):
 
 class ConvTransBlock(nn.Module):
     def __init__(self, conv_dim, trans_dim, head_dim, window_size, drop_path, type='W'):
+        """ SwinTransformer and Conv Block
+        """
         super(ConvTransBlock, self).__init__()
-        self.conv_dim = conv_dim  # e.g., 128
-        self.trans_dim = trans_dim  # e.g., 128
+        self.conv_dim = conv_dim
+        self.trans_dim = trans_dim
         self.head_dim = head_dim
         self.window_size = window_size
         self.drop_path = drop_path
         self.type = type
         assert self.type in ['W', 'SW']
-
-        # Convolutional path
-        self.conv_block = ResidualBlock(self.conv_dim, self.conv_dim)
-        self.conv1_1 = nn.Conv2d(self.conv_dim, self.conv_dim, kernel_size=1, stride=1, padding=0, bias=True)
-
-        # Transformer path
         self.trans_block = Block(self.trans_dim, self.trans_dim, self.head_dim, self.window_size, self.drop_path, self.type)
-        self.conv1_2 = nn.Conv2d(self.conv_dim, self.trans_dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.conv1_1 = nn.Conv2d(self.conv_dim+self.trans_dim, self.conv_dim+self.trans_dim, 1, 1, 0, bias=True)
+        self.conv1_2 = nn.Conv2d(self.conv_dim+self.trans_dim, self.conv_dim+self.trans_dim, 1, 1, 0, bias=True)
 
-        # Combine features from both paths
-        self.conv1_3 = nn.Conv2d(self.conv_dim + self.trans_dim, self.conv_dim, kernel_size=1, stride=1, padding=0, bias=True)
+        self.conv_block = ResidualBlock(self.conv_dim, self.conv_dim)
 
     def forward(self, x):
-        # Convolutional path
-        conv_x = self.conv1_1(x)  # [batch_size, conv_dim, H, W]
-        conv_x = self.conv_block(conv_x) + conv_x  # Residual connection
-
-        # Transformer path
-        trans_x = self.conv1_2(x)  # [batch_size, trans_dim, H, W]
-        trans_x = rearrange(trans_x, 'b c h w -> b h w c')
+        conv_x, trans_x = torch.split(self.conv1_1(x), (self.conv_dim, self.trans_dim), dim=1)
+        conv_x = self.conv_block(conv_x) + conv_x
+        trans_x = Rearrange('b c h w -> b h w c')(trans_x)
         trans_x = self.trans_block(trans_x)
-        trans_x = rearrange(trans_x, 'b h w c -> b c h w')
-
-        # Concatenate features and reduce channels
-        combined = torch.cat((conv_x, trans_x), dim=1)  # [batch_size, conv_dim + trans_dim, H, W]
-        res = self.conv1_3(combined)  # [batch_size, conv_dim, H, W]
-
-        # Residual connection
-        x = x + res  # Both x and res have conv_dim channels
+        trans_x = Rearrange('b h w c -> b c h w')(trans_x)
+        res = self.conv1_2(torch.cat((conv_x, trans_x), dim=1))
+        x = x + res
         return x
-class FeatureExtractor(nn.Module):
-    def __init__(self):
-        super(FeatureExtractor, self).__init__()
-        resnet50 = models.resnet50(pretrained=True)
-        self.feature_extractor = nn.Sequential(*list(resnet50.children())[:-3])
-    
-    def forward(self, x):
-        return self.feature_extractor(x)
 
-class CLM(nn.Module):
-    def __init__(self, dim):
-        super(CLM, self).__init__()
-        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
-        self.similarity = nn.Conv2d(dim * 2, 1, kernel_size=1)
-        
-    def forward(self, y, Y_r):
-        """
-        y: [batch_size, channels, H, W]
-        Y_r: [batch_size, num_references, channels, H, W]
-        """
-        y_m = self.conv(y)  # [batch_size, channels, H, W]
-        batch_size, num_refs, channels, H, W = Y_r.size()
-        Y_r = Y_r.view(batch_size * num_refs, channels, H, W)
-        y_m_expanded = y_m.unsqueeze(1).repeat(1, num_refs, 1, 1, 1).view(batch_size * num_refs, channels, H, W)
-        concat = torch.cat([y_m_expanded, Y_r], dim=1)  # [batch_size * num_refs, 2 * channels, H, W]
-        S = self.similarity(concat)  # [batch_size * num_refs, 1, H, W]
-        S = S.view(batch_size, num_refs, 1, H, W)
-        S = F.softmax(S, dim=1)  # [batch_size, num_refs, 1, H, W]
-        Y_r = Y_r.view(batch_size, num_refs, channels, H, W)
-        y_m = (S * Y_r).sum(dim=1)  # [batch_size, channels, H, W]
-        return y_m
+class SWAtten(AttentionBlock):
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path, inter_dim=192) -> None:
+        if inter_dim is not None:
+            super().__init__(N=inter_dim)
+            self.non_local_block = SwinBlock(inter_dim, inter_dim, head_dim, window_size, drop_path)
+        else:
+            super().__init__(N=input_dim)
+            self.non_local_block = SwinBlock(input_dim, input_dim, head_dim, window_size, drop_path)
+        if inter_dim is not None:
+            self.in_conv = conv1x1(input_dim, inter_dim)
+            self.out_conv = conv1x1(inter_dim, output_dim)
+
+    def forward(self, x):
+        x = self.in_conv(x)
+        identity = x
+        z = self.non_local_block(x)
+        a = self.conv_a(x)
+        b = self.conv_b(z)
+        out = a * torch.sigmoid(b)
+        out += identity
+        out = self.out_conv(out)
+        return out
+
+class SwinBlock(nn.Module):
+    def __init__(self, input_dim, output_dim, head_dim, window_size, drop_path) -> None:
+        super().__init__()
+        self.block_1 = Block(input_dim, output_dim, head_dim, window_size, drop_path, type='W')
+        self.block_2 = Block(input_dim, output_dim, head_dim, window_size, drop_path, type='SW')
+        self.window_size = window_size
+
+    def forward(self, x):
+        resize = False
+        if (x.size(-1) <= self.window_size) or (x.size(-2) <= self.window_size):
+            padding_row = (self.window_size - x.size(-2)) // 2
+            padding_col = (self.window_size - x.size(-1)) // 2
+            x = F.pad(x, (padding_col, padding_col+1, padding_row, padding_row+1))
+        trans_x = Rearrange('b c h w -> b h w c')(x)
+        trans_x = self.block_1(trans_x)
+        trans_x =  self.block_2(trans_x)
+        trans_x = Rearrange('b h w c -> b c h w')(trans_x)
+        if resize:
+            x = F.pad(x, (-padding_col, -padding_col-1, -padding_row, -padding_row-1))
+        return trans_x
+
+
 
 class CLS(nn.Module):
-    def __init__(self, dim):
-        super(CLS, self).__init__()
-        self.conv_mu = nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1)
-        self.conv_sigma = nn.Conv2d(dim * 2, dim, kernel_size=3, padding=1)
+    """Conditional Latent Synthesis module"""
+    def __init__(self, input_dim):
+        super().__init__()
+        self.fusion = nn.Sequential(
+            nn.Conv2d(input_dim * 2, input_dim, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(input_dim, input_dim, 3, padding=1)
+        )
+        self.weight_net = nn.Sequential(
+            nn.Conv2d(input_dim * 2, input_dim, 1),
+            nn.Sigmoid()
+        )
         
-    def forward(self, y, y_a):
-        mu = self.conv_mu(torch.cat([y, y_a], dim=1))
-        sigma = F.softplus(self.conv_sigma(torch.cat([y, y_a], dim=1)))
-        y_f = mu + sigma * torch.randn_like(mu)
-        return y_f, mu, sigma
+    def forward(self, y, y_refs_aligned):
+        """
+        Args:
+            y: Input latent tensor [B, C, H, W]
+            y_refs_aligned: List of aligned reference tensors [M, B, C, H, W]
+        """
+        # Combine aligned references
+        # y_refs_combined = torch.stack(y_refs_aligned, dim=0).mean(0)
+        
+        # Calculate adaptive fusion weights
+        combined = torch.cat([y, y_refs_aligned], dim=1)
+        weights = self.weight_net(combined)
+        
+        # Fuse features
+        fused = weights * y + (1 - weights) * y_refs_aligned
+        out = self.fusion(torch.cat([y, fused], dim=1))
+        
+        return out
+
 
 class CLC(CompressionModel):
-    def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=128, M=320, num_slices=5, max_support_slices=5, **kwargs):
+    def __init__(self, config=[2, 2, 2, 2, 2, 2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0, N=64,  M=320, num_slices=5, max_support_slices=5, **kwargs):
         super().__init__(entropy_bottleneck_channels=N)
         self.config = config
         self.head_dim = head_dim
         self.window_size = 8
         self.num_slices = num_slices
         self.max_support_slices = max_support_slices
+        dim = N
         self.M = M
+        dpr = [x.item() for x in torch.linspace(0, drop_path_rate, sum(config))]
+        begin = 0
+
+        self.m_down1 = [ConvTransBlock(dim, dim, self.head_dim[0], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
+                      for i in range(config[0])] + \
+                      [ResidualBlockWithStride(2*N, 2*N, stride=2)]
+        self.m_down2 = [ConvTransBlock(dim, dim, self.head_dim[1], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW')
+                      for i in range(config[1])] + \
+                      [ResidualBlockWithStride(2*N, 2*N, stride=2)]
+        self.m_down3 = [ConvTransBlock(dim, dim, self.head_dim[2], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW')
+                      for i in range(config[2])] + \
+                      [conv3x3(2*N, M, stride=2)]
+
+        self.m_up1 = [ConvTransBlock(dim, dim, self.head_dim[3], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
+                      for i in range(config[3])] + \
+                      [ResidualBlockUpsample(2*N, 2*N, 2)]
+        self.m_up2 = [ConvTransBlock(dim, dim, self.head_dim[4], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
+                      for i in range(config[4])] + \
+                      [ResidualBlockUpsample(2*N, 2*N, 2)]
+        self.m_up3 = [ConvTransBlock(dim, dim, self.head_dim[5], self.window_size, dpr[i+begin], 'W' if not i%2 else 'SW') 
+                      for i in range(config[5])] + \
+                      [subpel_conv3x3(2*N, 3, 2)]
         
-        # Encoder
-        self.g_a = nn.Sequential(
-            conv3x3(3, N),
-            ResidualBlockWithStride(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[0])],
-            ResidualBlockWithStride(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[1])],
-            ResidualBlockWithStride(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[2])],
-            conv3x3(N, M, stride=2)
-        )
+        self.g_a = nn.Sequential(*[ResidualBlockWithStride(3, 2*N, 2)] + self.m_down1 + self.m_down2 + self.m_down3)
         
-        # Decoder
-        self.g_s = nn.Sequential(
-            conv3x3(M, N),
-            ResidualBlockUpsample(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[3])],
-            ResidualBlockUpsample(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[4])],
-            ResidualBlockUpsample(N, N, 2),
-            *[ConvTransBlock(N, N, self.head_dim[i], self.window_size, 0, 'W' if i % 2 == 0 else 'SW') for i in range(config[5])],
-            subpel_conv3x3(N, 3, 2)
-        )
-        
-        # Hyperprior network
+
+        self.g_s = nn.Sequential(*[ResidualBlockUpsample(M, 2*N, 2)] + self.m_up1 + self.m_up2 + self.m_up3)
+
+        self.ha_down1 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
+                      for i in range(config[0])] + \
+                      [conv3x3(2*N, 192, stride=2)]
+
         self.h_a = nn.Sequential(
-            conv3x3(M, N),
-            nn.LeakyReLU(inplace=True),
-            conv3x3(N, N),
-            nn.LeakyReLU(inplace=True),
-            conv3x3(N, N),
-            nn.LeakyReLU(inplace=True),
+            *[ResidualBlockWithStride(320, 2*N, 2)] + \
+            self.ha_down1
         )
-        
-        # **Adjusted Hyper synthesis network (h_s)**
-        self.h_s = nn.Sequential(
-            conv3x3(N, N * 3 // 2),
-            nn.LeakyReLU(inplace=True),
-            conv3x3(N * 3 // 2, M * 2),
+
+        self.hs_up1 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
+                      for i in range(config[3])] + \
+                      [subpel_conv3x3(2*N, 320, 2)]
+
+        self.h_mean_s = nn.Sequential(
+            *[ResidualBlockUpsample(192, 2*N, 2)] + \
+            self.hs_up1
         )
-        
-        # CLM and CLS modules
-        self.clm = CLM(M)
-        self.cls = CLS(M)
-        
-        # Feature extractor
-        self.feature_extractor = FeatureExtractor()
-        
-        # Entropy models
-        self.entropy_bottleneck = EntropyBottleneck(N)
+
+        self.hs_up2 = [ConvTransBlock(N, N, 32, 4, 0, 'W' if not i%2 else 'SW') 
+                      for i in range(config[3])] + \
+                      [subpel_conv3x3(2*N, 320, 2)]
+
+
+        self.h_scale_s = nn.Sequential(
+            *[ResidualBlockUpsample(192, 2*N, 2)] + \
+            self.hs_up2
+        )
+
+
+        self.atten_mean = nn.ModuleList(
+            nn.Sequential(
+                SWAtten((320 + (320//self.num_slices)*min(i, 5)), (320 + (320//self.num_slices)*min(i, 5)), 16, self.window_size,0, inter_dim=128)
+            ) for i in range(self.num_slices)
+            )
+        self.atten_scale = nn.ModuleList(
+            nn.Sequential(
+                SWAtten((320 + (320//self.num_slices)*min(i, 5)), (320 + (320//self.num_slices)*min(i, 5)), 16, self.window_size,0, inter_dim=128)
+            ) for i in range(self.num_slices)
+            )
+        self.cc_mean_transforms = nn.ModuleList(
+            nn.Sequential(
+                conv(320 + (320//self.num_slices)*min(i, 5), 224, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(224, 128, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+            ) for i in range(self.num_slices)
+        )
+        self.cc_scale_transforms = nn.ModuleList(
+            nn.Sequential(
+                conv(320 + (320//self.num_slices)*min(i, 5), 224, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(224, 128, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+            ) for i in range(self.num_slices)
+            )
+
+        self.lrp_transforms = nn.ModuleList(
+            nn.Sequential(
+                conv(320 + (320//self.num_slices)*min(i+1, 6), 224, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(224, 128, stride=1, kernel_size=3),
+                nn.GELU(),
+                conv(128, (320//self.num_slices), stride=1, kernel_size=3),
+            ) for i in range(self.num_slices)
+        )
+
+        self.entropy_bottleneck = EntropyBottleneck(192)
         self.gaussian_conditional = GaussianConditional(None)
-        
-        # Context model
-        self.context_prediction = nn.Conv2d(M, M * 2, 3, padding=1)
-        
-        # **Adjusted Entropy parameters prediction**
-        self.entropy_parameters = nn.Sequential(
-            nn.Conv2d(M * 4, M * 2, 1),
-            nn.GELU(),
-            nn.Conv2d(M * 2, M * 2, 1),
-            nn.GELU(),
-            nn.Conv2d(M * 2, M * 2, 1),
-        )
-    
-    def forward(self, x, ref_x_list):
-        # Encoding process
-        y = self.g_a(x)
-        
-        # Process reference images
-        ref_y_list = [self.g_a(ref_x) for ref_x in ref_x_list]
-        
-        # CLM module
-        Y_r = torch.stack(ref_y_list, dim=1)  # [batch_size, num_refs, channels, H, W]
-        y_m = self.clm(y, Y_r)
-        
-        # CLS module
-        y_f, mu, sigma = self.cls(y, y_m)
-        
-        # Hyperprior
-        z = self.h_a(y_f)
-        z_hat, z_likelihoods = self.entropy_bottleneck(z)
-        
-        params = self.h_s(z_hat)
-        y_q = self.gaussian_conditional.quantize(y_f, 'noise' if self.training else 'dequantize', means=None)
-        
-        ctx_params = self.context_prediction(y_q)
-        gaussian_params = self.entropy_parameters(torch.cat((params, ctx_params), dim=1))
-        scales, means = gaussian_params.chunk(2, 1)
-        
-        y_hat, y_likelihoods = self.gaussian_conditional(y_f, scales, means)
-        
-        x_hat = self.g_s(y_hat)
-        
-        return {
-            "x_hat": x_hat,
-            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
-            "para": {"means": mu, "scales": sigma, "y": y_f}
-        }
-    
-    def compress(self, x, ref_x_list):
-        y = self.g_a(x)
-        ref_y_list = [self.g_a(ref_x) for ref_x in ref_x_list]
-        
-        Y_r = torch.stack(ref_y_list, dim=1)  # [batch_size, num_refs, channels, H, W]
-        y_m = self.clm(y, Y_r)
-        y_f, _, _ = self.cls(y, y_m)
-        
-        z = self.h_a(y_f)
-        z_strings = self.entropy_bottleneck.compress(z)
-        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
-        
-        params = self.h_s(z_hat)
-        
-        y_shape = y_f.size()[-2:]
-        y_strings = []
-        for i in range(y_f.size(1)):
-            y_i = y_f[:, i:i+1, :, :]
-            y_q = ste_round(y_i)
-            ctx_params = self.context_prediction(y_q)
-            gaussian_params = self.entropy_parameters(torch.cat((params, ctx_params), dim=1))
-            scales, means = gaussian_params.chunk(2, 1)
-            indexes = self.gaussian_conditional.build_indexes(scales)
-            y_string = self.gaussian_conditional.compress(y_i, indexes, means=means)
-            y_strings.append(y_string)
-        
-        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
-    
-    def decompress(self, strings, shape, ref_x_list):
-        assert isinstance(strings, list) and len(strings) == 2
-        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
-        params = self.h_s(z_hat)
-        
-        ref_y_list = [self.g_a(ref_x) for ref_x in ref_x_list]
-        Y_r = torch.stack(ref_y_list, dim=1)  # [batch_size, num_refs, channels, H, W]
-        
-        y_hat = []
-        for i, y_string in enumerate(strings[0]):
-            if i == 0:
-                y_i = torch.zeros((1, 1, shape[0] * 4, shape[1] * 4)).to(z_hat.device)
-            else:
-                y_i = torch.cat(y_hat, dim=1)
-            ctx_params = self.context_prediction(y_i)
-            gaussian_params = self.entropy_parameters(torch.cat((params, ctx_params), dim=1))
-            scales, means = gaussian_params.chunk(2, 1)
-            indexes = self.gaussian_conditional.build_indexes(scales)
-            y_hat_i = self.gaussian_conditional.decompress(y_string, indexes, means=means)
-            y_hat.append(y_hat_i)
-        y_hat = torch.cat(y_hat, dim=1)
-        
-        y_m = self.clm(y_hat, Y_r)
-        y_hat, _, _ = self.cls(y_hat, y_m)
-        
-        x_hat = self.g_s(y_hat)
-        x_hat.clamp_(0, 1)
-        return {"x_hat": x_hat}
-    
+
+        self.clm = CLM(320)
+        self.cls_compress = CLS(320)
+        self.clm_decompress = CLM(320)
+        self.cls_decompress = CLS(320)
+
     def update(self, scale_table=None, force=False):
         if scale_table is None:
             scale_table = get_scale_table()
@@ -468,6 +462,77 @@ class CLC(CompressionModel):
         updated |= super().update(force=force)
         return updated
     
+    def forward(self, x, x_refs=None):
+        y = self.g_a(x)
+        y_shape = y.shape[2:]
+        if x_refs is not None:
+            target_size = x.size()[2:]  
+            resized_ref_x_list = [
+            F.interpolate(ref_x, size=target_size, mode='bilinear', align_corners=False) 
+            for ref_x in x_refs
+            ]
+            y_refs = [self.g_a(x_ref) for x_ref in resized_ref_x_list]
+            # y_refs = torch.stack(y_refs, dim=1)
+            y_refs_aligned = self.clm(y, y_refs)
+            # y_refs_aligned = [self.clm(y, y_ref) for y_ref in y_refs]
+            y = self.cls_compress(y, y_refs_aligned)
+
+        z = self.h_a(y)
+        _, z_likelihoods = self.entropy_bottleneck(z)
+
+        z_offset = self.entropy_bottleneck._get_medians()
+        z_tmp = z - z_offset
+        z_hat = ste_round(z_tmp) + z_offset
+
+        latent_scales = self.h_scale_s(z_hat)
+        latent_means = self.h_mean_s(z_hat)
+
+        y_slices = y.chunk(self.num_slices, 1)
+        y_hat_slices = []
+        y_likelihood = []
+        mu_list = []
+        scale_list = []
+        for slice_index, y_slice in enumerate(y_slices):
+            support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
+            mean_support = torch.cat([latent_means] + support_slices, dim=1)
+            mean_support = self.atten_mean[slice_index](mean_support)
+            mu = self.cc_mean_transforms[slice_index](mean_support)
+            mu = mu[:, :, :y_shape[0], :y_shape[1]]
+            mu_list.append(mu)
+            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+            scale_support = self.atten_scale[slice_index](scale_support)
+            scale = self.cc_scale_transforms[slice_index](scale_support)
+            scale = scale[:, :, :y_shape[0], :y_shape[1]]
+            scale_list.append(scale)
+            _, y_slice_likelihood = self.gaussian_conditional(y_slice, scale, mu)
+            y_likelihood.append(y_slice_likelihood)
+            y_hat_slice = ste_round(y_slice - mu) + mu
+            # if self.training:
+            #     lrp_support = torch.cat([mean_support + torch.randn(mean_support.size()).cuda().mul(scale_support), y_hat_slice], dim=1)
+            # else:
+            lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
+            lrp = self.lrp_transforms[slice_index](lrp_support)
+            lrp = 0.5 * torch.tanh(lrp)
+            y_hat_slice += lrp
+
+            y_hat_slices.append(y_hat_slice)
+
+        y_hat = torch.cat(y_hat_slices, dim=1)
+        means = torch.cat(mu_list, dim=1)
+        scales = torch.cat(scale_list, dim=1)
+        y_likelihoods = torch.cat(y_likelihood, dim=1)
+        if x_refs is not None:
+            y_hat_aligned = self.clm_decompress(y_hat, y_refs)
+            y_hat = self.cls_decompress(y_hat, y_hat_aligned)
+
+        x_hat = self.g_s(y_hat)
+
+        return {
+            "x_hat": x_hat,
+            "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
+            "para":{"means": means, "scales":scales, "y":y}
+        }
+
     def load_state_dict(self, state_dict):
         update_registered_buffers(
             self.gaussian_conditional,
@@ -475,57 +540,320 @@ class CLC(CompressionModel):
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"],
             state_dict,
         )
-        super().load_state_dict(state_dict)
+        super().load_state_dict(state_dict, strict=False)
 
-# 使用 DDP 进行并行训练的代码示例
-def setup(rank, world_size):
-    torch.cuda.set_device(rank)
-    dist.init_process_group(
-        backend='nccl',
-        init_method='env://',
-        world_size=world_size,
-        rank=rank
-    )
+    @classmethod
+    def from_state_dict(cls, state_dict):
+        """Return a new model instance from `state_dict`."""
+        N = state_dict["g_a.0.weight"].size(0)
+        M = state_dict["g_a.6.weight"].size(0)
+        # net = cls(N, M)
+        net = cls(N, M)
+        net.load_state_dict(state_dict)
+        return net
 
-def cleanup():
-    dist.destroy_process_group()
+    def compress(self, x, x_refs=None):
+        y = self.g_a(x)
+        y_shape = y.shape[2:]
+        if x_refs is not None:
+            target_size = x.size()[2:]  
+            resized_ref_x_list = [
+            F.interpolate(ref_x, size=target_size, mode='bilinear', align_corners=False) 
+            for ref_x in x_refs
+            ]
+            y_refs = [self.g_a(x_ref) for x_ref in resized_ref_x_list]
+            # y_refs = torch.stack(y_refs, dim=1)
+            y_refs_aligned = self.clm(y, y_refs)
+            # y_refs_aligned = [self.clm(y, y_ref) for y_ref in y_refs]
+            y = self.cls_compress(y, y_refs_aligned)
 
-def main_worker(rank, world_size):
-    setup(rank, world_size)
-    device = torch.device('cuda', rank)
-    model = CLC().to(device)
-    # 使用 DDP 封装模型
-    model = DDP(model, device_ids=[rank], output_device=rank)
-    # 创建数据集和数据加载器
-    # 这里需要使用 DistributedSampler
-    # dataset = ...
-    # sampler = torch.utils.data.distributed.DistributedSampler(dataset)
-    # dataloader = DataLoader(dataset, batch_size=..., sampler=sampler)
-    # for data in dataloader:
-    #     ...
+        z = self.h_a(y)
+        z_strings = self.entropy_bottleneck.compress(z)
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z.size()[-2:])
 
-    # 示例输入
-    x = torch.randn((1, 3, 256, 256)).to(device)
-    ref_x_list = [torch.randn((1, 3, 256, 256)).to(device) for _ in range(3)]  # 3 reference images
+        latent_scales = self.h_scale_s(z_hat)
+        latent_means = self.h_mean_s(z_hat)
 
-    output = model(x, ref_x_list)
-    print(f"Rank {rank} output keys:", output.keys())
-    cleanup()
+        y_slices = y.chunk(self.num_slices, 1)
+        y_hat_slices = []
+        y_scales = []
+        y_means = []
+
+        cdf = self.gaussian_conditional.quantized_cdf.tolist()
+        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
+        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
+
+        encoder = BufferedRansEncoder()
+        symbols_list = []
+        indexes_list = []
+        y_strings = []
+
+        for slice_index, y_slice in enumerate(y_slices):
+            support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
+
+            mean_support = torch.cat([latent_means] + support_slices, dim=1)
+            mean_support = self.atten_mean[slice_index](mean_support)
+            mu = self.cc_mean_transforms[slice_index](mean_support)
+            mu = mu[:, :, :y_shape[0], :y_shape[1]]
+
+            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+            scale_support = self.atten_scale[slice_index](scale_support)
+            scale = self.cc_scale_transforms[slice_index](scale_support)
+            scale = scale[:, :, :y_shape[0], :y_shape[1]]
+
+            index = self.gaussian_conditional.build_indexes(scale)
+            y_q_slice = self.gaussian_conditional.quantize(y_slice, "symbols", mu)
+            y_hat_slice = y_q_slice + mu
+
+            symbols_list.extend(y_q_slice.reshape(-1).tolist())
+            indexes_list.extend(index.reshape(-1).tolist())
+
+
+            lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
+            lrp = self.lrp_transforms[slice_index](lrp_support)
+            lrp = 0.5 * torch.tanh(lrp)
+            y_hat_slice += lrp
+
+            y_hat_slices.append(y_hat_slice)
+            y_scales.append(scale)
+            y_means.append(mu)
+
+        encoder.encode_with_indexes(symbols_list, indexes_list, cdf, cdf_lengths, offsets)
+        y_string = encoder.flush()
+        y_strings.append(y_string)
+
+        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
+
+
+
+    def _likelihood(self, inputs, scales, means=None):
+        half = float(0.5)
+        if means is not None:
+            values = inputs - means
+        else:
+            values = inputs
+
+        scales = torch.max(scales, torch.tensor(0.11))
+        values = torch.abs(values)
+        upper = self._standardized_cumulative((half - values) / scales)
+        lower = self._standardized_cumulative((-half - values) / scales)
+        likelihood = upper - lower
+        return likelihood
+
+    def _standardized_cumulative(self, inputs):
+        half = float(0.5)
+        const = float(-(2 ** -0.5))
+        # Using the complementary error function maximizes numerical precision.
+        return half * torch.erfc(const * inputs)
+
+    def decompress(self, strings, shape, x_refs=None, x_shape = None):
+        z_hat = self.entropy_bottleneck.decompress(strings[1], shape)
+        latent_scales = self.h_scale_s(z_hat)
+        latent_means = self.h_mean_s(z_hat)
+
+        y_shape = [z_hat.shape[2] * 4, z_hat.shape[3] * 4]
+
+        y_string = strings[0][0]
+
+        y_hat_slices = []
+        cdf = self.gaussian_conditional.quantized_cdf.tolist()
+        cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
+        offsets = self.gaussian_conditional.offset.reshape(-1).int().tolist()
+
+        decoder = RansDecoder()
+        decoder.set_stream(y_string)
+
+        for slice_index in range(self.num_slices):
+            support_slices = (y_hat_slices if self.max_support_slices < 0 else y_hat_slices[:self.max_support_slices])
+            mean_support = torch.cat([latent_means] + support_slices, dim=1)
+            mean_support = self.atten_mean[slice_index](mean_support)
+            mu = self.cc_mean_transforms[slice_index](mean_support)
+            mu = mu[:, :, :y_shape[0], :y_shape[1]]
+
+            scale_support = torch.cat([latent_scales] + support_slices, dim=1)
+            scale_support = self.atten_scale[slice_index](scale_support)
+            scale = self.cc_scale_transforms[slice_index](scale_support)
+            scale = scale[:, :, :y_shape[0], :y_shape[1]]
+
+            index = self.gaussian_conditional.build_indexes(scale)
+
+            rv = decoder.decode_stream(index.reshape(-1).tolist(), cdf, cdf_lengths, offsets)
+            rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1])
+            y_hat_slice = self.gaussian_conditional.dequantize(rv, mu)
+
+            lrp_support = torch.cat([mean_support, y_hat_slice], dim=1)
+            lrp = self.lrp_transforms[slice_index](lrp_support)
+            lrp = 0.5 * torch.tanh(lrp)
+            y_hat_slice += lrp
+
+            y_hat_slices.append(y_hat_slice)
+
+        y_hat = torch.cat(y_hat_slices, dim=1)
+        if x_refs is not None:
+            assert x_shape is not None
+            target_size = x_shape[-2:]  
+            resized_ref_x_list = [
+            F.interpolate(ref_x, size=target_size, mode='bilinear', align_corners=False) 
+            for ref_x in x_refs
+            ]
+            y_refs = [self.g_a(x_ref) for x_ref in resized_ref_x_list]
+            # y_refs = torch.stack(y_refs, dim=1)
+            # y_refs_aligned = self.clm(y_hat, y_refs)
+            # y_refs_aligned = [self.clm(y, y_ref) for y_ref in y_refs]
+            y_hat_aligned = self.clm_decompress(y_hat, y_refs)
+            y_hat = self.cls_decompress(y_hat, y_hat_aligned)
+        x_hat = self.g_s(y_hat).clamp_(0, 1)
+
+        return {"x_hat": x_hat}
+
+
 
 if __name__ == "__main__":
-    world_size = torch.cuda.device_count()
-    world_size = 1
-    if world_size > 1:
-        # 使用 torch.multiprocessing.spawn 启动多个进程
-        torch.multiprocessing.spawn(main_worker, args=(world_size,), nprocs=world_size)
-    else:
-        # 单 GPU 训练
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        x = torch.randn((1, 3, 256, 256)).to(device)
-        ref_x_list = [torch.randn((1, 3, 256, 256)).to(device) for _ in range(3)]  # 3 reference images
-        model = CLC().to(device)
-        output = model(x, ref_x_list)
-        print(output.keys())
-        print(output['x_hat'].shape)
-        print(output['likelihoods']['y'].shape)
-        print(output['likelihoods']['z'].shape)
+    import torch
+    import numpy as np
+    from PIL import Image
+    import torchvision.transforms as transforms
+    import matplotlib.pyplot as plt
+    import sys
+    sys.path.append('/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM')
+    from dataloader_ref_cluster import LICDataset
+    import argparse
+
+    parser = argparse.ArgumentParser(description='测试数据集是否存在缺失值.')
+    parser.add_argument('--data_path', type=str, 
+                       default='/h3cstore_ns/ydchen/DATASET/kodak.hdf5', 
+                       help='主数据集路径')
+    parser.add_argument('--ref_path', type=str, 
+                       default='/h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/Flickr2K.hdf5', 
+                       help='参考数据集路径')
+    parser.add_argument('--feature_cache_path', type=str, 
+                       default='/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/model_ckpt_TCM/data_cluster_feature/flicker_features.pkl', 
+                       help='特征缓存路径')
+    parser.add_argument('--n_clusters', type=int, default=3000, help='聚类数量')
+    parser.add_argument('--n_refs', type=int, default=3, help='参考图像数量')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--patch_size', type=int, nargs=2, default=[256, 256], help='图片块大小')
+    parser.add_argument('--cuda', action='store_true', help='是否使用CUDA')
+    parser.add_argument('--num_workers', type=int, default=0, help='数据加载的工作进程数')
+    parser.add_argument('--query_image', type=str, default='/h3cstore_ns/ydchen/DATASET/kodak/kodim05.png', help='用于测试图片检索的查询图片路径')
+
+    args = parser.parse_args()
+    
+    # 设置设备
+    device = 'cuda' if args.cuda and torch.cuda.is_available() else 'cpu'
+    
+    # 初始化数据集
+    transform = transforms.Compose([
+        transforms.Resize(args.patch_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    dataset = LICDataset(
+        path=args.data_path,
+        ref_path=args.ref_path,
+        transform=transform,
+        device=device,
+        batch_size=args.batch_size,
+        feature_cache_path=args.feature_cache_path,
+        n_clusters=args.n_clusters,
+        n_refs=args.n_refs
+    )
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+    # 读取图片
+    img_path = '/h3cstore_ns/ydchen/DATASET/kodak/kodim05.png'
+    img = Image.open(img_path)
+
+    # 转换图片为tensor，范围归一化到[0,1]
+    transform = transforms.Compose([
+        # transforms.Resize(args.patch_size),
+        transforms.ToTensor()
+    ])
+    x = transform(img).unsqueeze(0).to(device)  # 添加batch维度
+
+
+    print("\nTesting image retrieval:")
+    similar_images, similar_keys = dataset.retrieve_similar_images(
+        img_path,
+        n_refs=args.n_refs)
+
+    ref_x_list = []
+
+    for img in similar_images:
+        # 重塑每个图像
+        reshaped_img = img.reshape(-1, 3)  # 变成(256*256, 3)
+        # 归一化
+        normalized_img = reshaped_img / 255.0
+        # add batch dimension
+        normalized_img = normalized_img.reshape(1, 3, 256, 256).astype(np.float32)
+        # 转换为tensor并添加到列表
+        ref_x_list.append(torch.from_numpy(normalized_img).to(device))
+
+    # ref_x_list = [torch.randn((1, 3, 256, 256)).to(device) for _ in range(3)]  # 3 reference images
+    model_path = '/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/clc_trained_model_final_modify_no_amp/0.0035checkpoint_best.pth.tar'
+    model = CLC()
+    checkpoint = torch.load(model_path, map_location=device)
+    new_weights = {}
+    for k, v in checkpoint['state_dict'].items():
+        new_weights[k.replace('module.', '')] = v
+    model.load_state_dict(new_weights)
+    model = model.to(device)
+    output = model(x, ref_x_list)
+    # output = model(x)
+
+
+    # calc bpp and mse
+    x_hat = output['x_hat']
+    y_likelihoods = output['likelihoods']['y']
+    z_likelihoods = output['likelihoods']['z']
+    num_pixels = x.shape[2] * x.shape[3]
+    bpp_y = -torch.sum(torch.log2(y_likelihoods)) / num_pixels
+    bpp_z = -torch.sum(torch.log2(z_likelihoods)) / num_pixels
+    bpp_total = bpp_y + bpp_z
+    
+    # 计算MSE
+    mse = torch.mean((x - x_hat) ** 2)
+    psnr = -10 * torch.log10(mse)
+    results = {
+        'bpp': {
+            'y': bpp_y.item(),
+            'z': bpp_z.item(),
+            'total': bpp_total.item()
+        },
+        'mse': mse.item(),
+        'psnr': psnr.item(),
+    }
+    # 计算PSNR (假设最大值为1)
+    psnr = -10 * torch.log10(mse)
+    print("\nCompression Results:")
+    print(f"Bits per pixel (total): {results['bpp']['total']:.4f}")
+    print(f"  - BPP (y): {results['bpp']['y']:.4f}")
+    print(f"  - BPP (z): {results['bpp']['z']:.4f}")
+    print(f"MSE: {results['mse']:.6f}")
+    print(f"PSNR: {results['psnr']:.2f} dB")
+
+    # 保存对比图
+    save_path = '/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/CLC_trained_model_1224/comparison.png'  # 可以修改保存路径
+
+    # 将tensor转换为numpy数组并调整维度顺序
+    x_np = x.squeeze(0).cpu().numpy().transpose(1, 2, 0)  # (H, W, C)
+    x_hat_np = x_hat.squeeze(0).detach().cpu().numpy().transpose(1, 2, 0)
+
+    # 创建对比图
+    plt.figure(figsize=(12, 6))
+
+    plt.subplot(121)
+    plt.imshow(x_np)
+    plt.title('Original')
+    plt.axis('off')
+
+    plt.subplot(122)
+    plt.imshow(x_hat_np)
+    plt.title(f'Reconstructed\nMSE: {mse:.6f}\nBPP: {bpp_y + bpp_z:.4f}')
+    plt.axis('off')
+
+    plt.tight_layout()
+    plt.savefig(save_path)
+    plt.close()
