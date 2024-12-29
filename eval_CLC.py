@@ -2,7 +2,7 @@ import torch
 import torch.nn.functional as F
 from torchvision import transforms
 from models import TCM, CLC
-from dataloader_CLC import LICDataset
+from dataloader_ref_cluster import LICDataset
 import warnings
 import os
 import sys
@@ -14,7 +14,7 @@ from PIL import Image
 
 warnings.filterwarnings("ignore")
 
-print(torch.cuda.is_available())
+# print(torch.cuda.is_available())
 
 def compute_psnr(a, b):
     mse = torch.mean((a - b)**2).item()
@@ -51,7 +51,7 @@ def crop(x, padding):
         (-padding[0], -padding[1], -padding[2], -padding[3]),
     )
 
-def parse_args(argv):
+def parse_args():
     parser = argparse.ArgumentParser(description="Example testing script.")
     parser.add_argument("--cuda", action="store_true", help="Use cuda")
     parser.add_argument(
@@ -60,24 +60,27 @@ def parse_args(argv):
         type=float,
         help="gradient clipping max norm (default: %(default)s",
     )
-    parser.add_argument("--checkpoint", type=str, help="Path to a checkpoint")
-    parser.add_argument("--data", type=str, help="Path to dataset")
+    parser.add_argument("--checkpoint", type=str, default='/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/tcm_trained_model_final_modify_no_amp/0.0035checkpoint_best.pth.tar',
+                        help="Path to a checkpoint")
+    parser.add_argument("--data", type=str, default='/h3cstore_ns/ydchen/DATASET/kodak.hdf5',
+                        help="Path to dataset")
     parser.add_argument(
         "--real", action="store_true", default=True
     )
     parser.add_argument(
         "--model", type=str, choices=['tcm', 'clc'], default='tcm', help="Model to use"
     )
-    parser.add_argument("--ref_path", type=str, help="Path to reference dataset for CLC")
-    parser.add_argument("--feature_cache_path", type=str, help="Path to feature cache for CLC")
+    parser.add_argument("--ref_path", type=str, default='/h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/Flickr2K.hdf5',
+                        help="Path to reference dataset for CLC")
+    parser.add_argument("--feature_cache_path", type=str, default='/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/model_ckpt_TCM/data_cluster_feature/flicker_features.pkl',
+                        help="Path to feature cache for CLC")
     parser.add_argument("--n_clusters", type=int, default=3000, help="Number of clusters for CLC")
     parser.add_argument("--n_refs", type=int, default=3, help="Number of reference images for CLC")
     parser.set_defaults(real=False)
-    args = parser.parse_args(argv)
+    args = parser.parse_args()
     return args
 
-def main(argv):
-    args = parse_args(argv)
+def main(args):
     p = 128
     path = args.data
     if args.cuda:
@@ -85,19 +88,16 @@ def main(argv):
     else:
         device = 'cpu'
 
-    if args.model == 'clc':
-        net = CLC(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=128, M=320)
-        test_dataset = LICDataset(
-            args.data,
-            args.ref_path,
-            transform=transforms.ToTensor(),
-            feature_cache_path=args.feature_cache_path,
-            n_clusters=args.n_clusters,
-            n_refs=args.n_refs
-        )
-    else:
-        net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=128, M=320)
-        img_list = [f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+
+    net = CLC(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=64, M=320)
+    test_dataset = LICDataset(
+        args.data,
+        args.ref_path,
+        transform=transforms.ToTensor(),
+        feature_cache_path=args.feature_cache_path,
+        n_clusters=args.n_clusters,
+        n_refs=args.n_refs
+    )
 
     net = net.to(device)
     net.eval()
@@ -116,117 +116,50 @@ def main(argv):
             dictory[k.replace("module.", "")] = v
         net.load_state_dict(dictory)
 
-    if args.real:
-        net.update()
-        if args.model == 'clc':
-            for sample, ref_samples, key, ref_keys in test_dataset:
-                x = sample.unsqueeze(0).to(device)
-                ref_samples = [r.unsqueeze(0).to(device) for r in ref_samples]
-                x_padded, padding = pad(x, p)
-                ref_samples_padded = [pad(r, p)[0] for r in ref_samples]
-                count += 1
-                with torch.no_grad():
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    s = time.time()
-                    out_enc = net.compress(x_padded, ref_samples_padded)
-                    out_dec = net.decompress(out_enc["strings"], out_enc["shape"], ref_samples_padded)
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    e = time.time()
-                    total_time += (e - s)
-                    out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
-                    num_pixels = x.size(0) * x.size(2) * x.size(3)
-                    print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
-                    print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-                    print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-                    Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
-                    PSNR += compute_psnr(x, out_dec["x_hat"])
-                    MS_SSIM += compute_msssim(x, out_dec["x_hat"])
-        else:
-            for img_name in img_list:
-                img_path = os.path.join(path, img_name)
-                img = transforms.ToTensor()(Image.open(img_path).convert('RGB')).to(device)
-                x = img.unsqueeze(0)
-                x_padded, padding = pad(x, p)
-                count += 1
-                with torch.no_grad():
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    s = time.time()
-                    out_enc = net.compress(x_padded)
-                    out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    e = time.time()
-                    total_time += (e - s)
-                    out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
-                    num_pixels = x.size(0) * x.size(2) * x.size(3)
-                    print(f'Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
-                    print(f'MS-SSIM: {compute_msssim(x, out_dec["x_hat"]):.2f}dB')
-                    print(f'PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
-                    Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
-                    PSNR += compute_psnr(x, out_dec["x_hat"])
-                    MS_SSIM += compute_msssim(x, out_dec["x_hat"])
-    else:
-        if args.model == 'clc':
-            for sample, ref_samples, key, ref_keys in test_dataset:
-                x = sample.unsqueeze(0).to(device)
-                ref_samples = [r.unsqueeze(0).to(device) for r in ref_samples]
-                x_padded, padding = pad(x, p)
-                ref_samples_padded = [pad(r, p)[0] for r in ref_samples]
-                count += 1
-                with torch.no_grad():
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    s = time.time()
-                    out_net = net(x_padded, ref_samples_padded)
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    e = time.time()
-                    total_time += (e - s)
-                    out_net['x_hat'].clamp_(0, 1)
-                    out_net["x_hat"] = crop(out_net["x_hat"], padding)
-                    print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
-                    print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
-                    print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
-                    PSNR += compute_psnr(x, out_net["x_hat"])
-                    MS_SSIM += compute_msssim(x, out_net["x_hat"])
-                    Bit_rate += compute_bpp(out_net)
-        else:
-            for img_name in img_list:
-                img_path = os.path.join(path, img_name)
-                img = Image.open(img_path).convert('RGB')
-                x = transforms.ToTensor()(img).unsqueeze(0).to(device)
-                x_padded, padding = pad(x, p)
-                count += 1
-                with torch.no_grad():
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    s = time.time()
-                    out_net = net(x_padded)
-                    if args.cuda:
-                        torch.cuda.synchronize()
-                    e = time.time()
-                    total_time += (e - s)
-                    out_net['x_hat'].clamp_(0, 1)
-                    out_net["x_hat"] = crop(out_net["x_hat"], padding)
-                    print(f'PSNR: {compute_psnr(x, out_net["x_hat"]):.2f}dB')
-                    print(f'MS-SSIM: {compute_msssim(x, out_net["x_hat"]):.2f}dB')
-                    print(f'Bit-rate: {compute_bpp(out_net):.3f}bpp')
-                    PSNR += compute_psnr(x, out_net["x_hat"])
-                    MS_SSIM += compute_msssim(x, out_net["x_hat"])
-                    Bit_rate += compute_bpp(out_net)
+
+    net.update()
+
+    for sample, ref_samples, key, ref_keys in test_dataset:
+        x = sample.unsqueeze(0).to(device)
+        ref_samples = [r.unsqueeze(0).to(device) for r in ref_samples]
+        x_padded, padding = pad(x, p)
+        ref_samples_padded = [pad(r, p)[0] for r in ref_samples]
+        count += 1
+        with torch.no_grad():
+            if args.cuda:
+                torch.cuda.synchronize()
+            s = time.time()
+            if args.model == 'clc':
+                out_enc = net.compress(x_padded, ref_samples_padded)
+                out_dec = net.decompress(out_enc["strings"], out_enc["shape"], ref_samples_padded, x.shape)
+            else:
+                out_enc = net.compress(x_padded)
+                out_dec = net.decompress(out_enc["strings"], out_enc["shape"])
+            if args.cuda:
+                torch.cuda.synchronize()
+            e = time.time()
+            total_time += (e - s)
+            out_dec["x_hat"] = crop(out_dec["x_hat"], padding)
+            num_pixels = x.size(0) * x.size(2) * x.size(3)
+            print(f'{key} Bitrate: {(sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels):.3f}bpp')
+            print(f'{key} PSNR: {compute_psnr(x, out_dec["x_hat"]):.2f}dB')
+            Bit_rate += sum(len(s[0]) for s in out_enc["strings"]) * 8.0 / num_pixels
+            PSNR += compute_psnr(x, out_dec["x_hat"])
+
+
+
 
     PSNR = PSNR / count
-    MS_SSIM = MS_SSIM / count
     Bit_rate = Bit_rate / count
     total_time = total_time / count
     print(f'average_PSNR: {PSNR:.2f}dB')
-    print(f'average_MS-SSIM: {MS_SSIM:.4f}')
     print(f'average_Bit-rate: {Bit_rate:.3f} bpp')
     print(f'average_time: {total_time:.3f} ms')
 
 if __name__ == "__main__":
-    print(torch.cuda.is_available())
-    main(sys.argv[1:])
+    if torch.cuda.is_available():
+        print("Using GPU")
+    else:
+        print("Using CPU")
+    args = parse_args()
+    main(args)

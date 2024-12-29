@@ -1,16 +1,19 @@
-python3 /data/wsq96/CLC_data/CLC/train_CLC.py \
-    -d /img_video/img/Flicker2W.hdf5 \
-    --ref_path /img_video/img/Flicker2K.hdf5 \
-    --feature_cache_path /h3cstore_ns/ydchen/code/CompressAI/data_cluster_feature/flicker_features.pkl \
-    --save_path /data/wsq96/CLC_data/CompressAI/LIC_TCM/trained_model_1023_cyd_test \
+python3 /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/train_CLC.py \
+    -d /h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/flicker2W_org.hdf5 \
+    --ref_path /h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/Flickr2K.hdf5 \
+    --test_dataset /h3cstore_ns/ydchen/DATASET/kodak.hdf5 \
+    --feature_cache_path /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/model_ckpt_TCM/data_cluster_feature/flicker_features.pkl \
+    --save_path /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/clc_trained_model_final_modify_no_amp_clm_decompress \
+    --model clc \
     --lambda 0.01 \
     --epochs 50 \
-    --batch-size 1 \
+    --batch-size 80 \
     --learning-rate 1e-4 \
     --n_refs 3 \
-    --n_clusters 1000 \
+    --N 64 \
+    --n_clusters 3000 \
     --type mse \
     --patch-size 256 256 \
     --cuda \
-    --use-mixed-precision \
-    --num-workers 0
+    --num-workers 0 \
+    --checkpoint /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/clc_trained_model_final_modify_no_amp/0.01checkpoint_best.pth.tar

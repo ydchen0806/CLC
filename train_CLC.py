@@ -2,6 +2,13 @@ import argparse
 import math
 import random
 import sys
+import time
+from collections import defaultdict
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+import os
+# os.environ["CUDA_VISIBLE_DEVICES"] = "0"  # 0 表示第一张卡
 
 import torch
 import torch.nn as nn
@@ -17,10 +24,11 @@ from pytorch_msssim import ms_ssim
 import torch.multiprocessing as mp
 from models import TCM, CLC
 from torch.utils.tensorboard import SummaryWriter   
-import os
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
+
+
 
 def compute_msssim(a, b):
     return ms_ssim(a, b, data_range=1.)
@@ -89,79 +97,126 @@ def configure_optimizers(net, args):
     assert len(inter_params) == 0
     assert len(union_params) - len(params_dict.keys()) == 0
 
-    optimizer = optim.Adam(
+    # optimizer = optim.Adam(
+    #     (params_dict[n] for n in sorted(parameters)),
+    #     lr=args.learning_rate,
+    # )
+    # aux_optimizer = optim.Adam(
+    #     (params_dict[n] for n in sorted(aux_parameters)),
+    #     lr=args.aux_learning_rate,
+    # )
+    optimizer = optim.AdamW(
         (params_dict[n] for n in sorted(parameters)),
         lr=args.learning_rate,
     )
-    aux_optimizer = optim.Adam(
+    aux_optimizer = optim.AdamW(
         (params_dict[n] for n in sorted(aux_parameters)),
         lr=args.aux_learning_rate,
     )
+    
     return optimizer, aux_optimizer
 
 def train_one_epoch(
-    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, scaler, use_mixed_precision, type='mse'
+    model, criterion, train_dataloader, optimizer, aux_optimizer, epoch, clip_max_norm, scaler, use_mixed_precision, type='mse', args = None
 ):
     model.train()
     device = next(model.parameters()).device
-
+    
+    # 初始化计时器
+    timers = defaultdict(float)
+    
     for i, d in enumerate(train_dataloader):
+        iter_start = time.time()
+        
+        # 数据加载计时
+        data_start = time.time()
         sample, ref_samples, key, ref_keys = d
         sample = sample.to(device)
         ref_samples = [r.to(device) for r in ref_samples]
+        timers['data_loading'] += time.time() - data_start
 
         optimizer.zero_grad()
         aux_optimizer.zero_grad()
 
-        # Use mixed precision if enabled
+        # 前向传播计时
+        forward_start = time.time()
         if use_mixed_precision:
-            with torch.cuda.amp.autocast():
-                out_net = model(sample, ref_samples)
+            with torch.amp.autocast('cuda'):
+                if args.model == 'clc':
+                    out_net = model(sample, ref_samples)
+                else:
+                    out_net = model(sample)
+                # out_net = model(sample)
                 out_criterion = criterion(out_net, sample)
             scaler.scale(out_criterion["loss"]).backward()
         else:
-            out_net = model(sample, ref_samples)
+            if args.model == 'clc':
+                out_net = model(sample, ref_samples)
+            else:
+                out_net = model(sample)
+
             out_criterion = criterion(out_net, sample)
             out_criterion["loss"].backward()
+        timers['forward_pass'] += time.time() - forward_start
 
+        # 反向传播和优化计时
+        backward_start = time.time()
         if clip_max_norm > 0:
             if use_mixed_precision:
                 scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), clip_max_norm)
 
         if use_mixed_precision:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.nan_to_num_()
             scaler.step(optimizer)
             scaler.update()
         else:
+            for p in model.parameters():
+                if p.grad is not None:
+                    p.grad.nan_to_num_()
             optimizer.step()
 
         aux_loss = model.aux_loss()
         aux_loss.backward()
         aux_optimizer.step()
+        timers['backward_pass'] += time.time() - backward_start
 
-        if i % 100 == 0:
+        if i % 500 == 0:
+            # 计算每次迭代的总时间
+            iter_time = time.time() - iter_start
+            timers['total'] += iter_time
+            
             if type == 'mse':
                 print(
                     f"Train epoch {epoch}: ["
                     f"{i*len(sample)}/{len(train_dataloader.dataset)}"
                     f" ({100. * i / len(train_dataloader):.0f}%)]"
-                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                    f'\tMSE loss: {out_criterion["mse_loss"].item():.3f} |'
-                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
+                    f'\tLoss: {out_criterion["loss"].item():.5f} |'
+                    f'\tMSE loss: {out_criterion["mse_loss"].item():.5f} |'
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f} |'
+                    f"\tAux loss: {aux_loss.item():.3f}"
                 )
             else:
                 print(
                     f"Train epoch {epoch}: ["
                     f"{i*len(sample)}/{len(train_dataloader.dataset)}"
                     f" ({100. * i / len(train_dataloader):.0f}%)]"
-                    f'\tLoss: {out_criterion["loss"].item():.3f} |'
-                    f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.3f} |'
-                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.2f} |'
-                    f"\tAux loss: {aux_loss.item():.2f}"
+                    f'\tLoss: {out_criterion["loss"].item():.5f} |'
+                    f'\tMS_SSIM loss: {out_criterion["ms_ssim_loss"].item():.5f} |'
+                    f'\tBpp loss: {out_criterion["bpp_loss"].item():.3f} |'
+                    f"\tAux loss: {aux_loss.item():.3f}"
                 )
+            
+            # 打印每个部分的耗时统计
+            print(f"Timing stats (sec) - "
+                  f"Data loading: {timers['data_loading']/(i+1):.3f}/iter | "
+                  f"Forward pass: {timers['forward_pass']/(i+1):.3f}/iter | "
+                  f"Backward pass: {timers['backward_pass']/(i+1):.3f}/iter | "
+                  f"Total: {timers['total']/(i+1):.3f}/iter")
 
-def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
+def test_epoch(epoch, test_dataloader, model, criterion, type='mse', args = None):
     model.eval()
     device = next(model.parameters()).device
 
@@ -176,8 +231,10 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
             sample, ref_samples, key, ref_keys = d
             sample = sample.to(device)
             ref_samples = [r.to(device) for r in ref_samples]
-
-            out_net = model(sample, ref_samples)
+            if args.model == 'clc':
+                out_net = model(sample, ref_samples)
+            else:
+                out_net = model(sample)
             out_criterion = criterion(out_net, sample)
 
             aux_loss.update(model.aux_loss())
@@ -191,18 +248,18 @@ def test_epoch(epoch, test_dataloader, model, criterion, type='mse'):
     if type == 'mse':
         print(
             f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMSE loss: {mse_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tLoss: {loss.avg:.5f} |"
+            f"\tMSE loss: {mse_loss.avg:.5f} |"
+            f"\tBpp loss: {bpp_loss.avg:.3f} |"
+            f"\tAux loss: {aux_loss.avg:.3f}\n"
         )
     else:
         print(
             f"Test epoch {epoch}: Average losses:"
-            f"\tLoss: {loss.avg:.3f} |"
-            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.3f} |"
-            f"\tBpp loss: {bpp_loss.avg:.2f} |"
-            f"\tAux loss: {aux_loss.avg:.2f}\n"
+            f"\tLoss: {loss.avg:.5f} |"
+            f"\tMS_SSIM loss: {ms_ssim_loss.avg:.5f} |"
+            f"\tBpp loss: {bpp_loss.avg:.3f} |"
+            f"\tAux loss: {aux_loss.avg:.3f}\n"
         )
 
     return loss.avg
@@ -260,9 +317,10 @@ def parse_args(argv):
     parser.add_argument(
         "--test-batch-size",
         type=int,
-        default=8,
+        default=1,
         help="Test batch size (default: %(default)s)",
     )
+    parser.add_argument("--test_dataset", type=str, default="/h3cstore_ns/ydchen/DATASET/kodak.hdf5", help="Test dataset")
     parser.add_argument(
         "--aux-learning-rate",
         default=1e-3,
@@ -284,7 +342,7 @@ def parse_args(argv):
     )
     parser.add_argument(
         "--clip_max_norm",
-        default=1.0,
+        default=1,
         type=float,
         help="gradient clipping max norm (default: %(default)s)",
     )
@@ -311,8 +369,8 @@ def parse_args(argv):
     # New argument for mixed precision training
     parser.add_argument(
         "--use-mixed-precision",
-        action="store_true",
-        default=True,
+        default=False,
+        type=bool,
         help="Use mixed precision training (default: %(default)s)",
     )
 
@@ -342,7 +400,7 @@ def main(argv):
         [transforms.CenterCrop(args.patch_size), transforms.ToTensor()]
     )
 
-    if args.model == "clc":
+    if args.model == "clc" or args.model == "tcm":
         train_dataset = LICDataset(
             args.dataset,
             args.ref_path,
@@ -352,7 +410,7 @@ def main(argv):
             n_refs=args.n_refs
         )
         test_dataset = LICDataset(
-            args.dataset,
+            args.test_dataset,
             args.ref_path,
             transform=test_transforms,
             feature_cache_path=args.feature_cache_path,
@@ -387,10 +445,7 @@ def main(argv):
         net = CLC(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
     else:
         net = TCM(config=[2,2,2,2,2,2], head_dim=[8, 16, 32, 32, 16, 8], drop_path_rate=0.0, N=args.N, M=320)
-    net = net.to(device)
 
-    if args.cuda and torch.cuda.device_count() > 1:
-        net = CustomDataParallel(net)
 
     optimizer, aux_optimizer = configure_optimizers(net, args)
     milestones = args.lr_epoch
@@ -403,12 +458,19 @@ def main(argv):
     if args.checkpoint:  # load from previous checkpoint
         print("Loading", args.checkpoint)
         checkpoint = torch.load(args.checkpoint, map_location=device)
-        net.load_state_dict(checkpoint["state_dict"])
-        if args.continue_train:
-            last_epoch = checkpoint["epoch"] + 1
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
-            lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+        new_weights = {}
+        for k, v in checkpoint['state_dict'].items():
+            new_weights[k.replace('module.', '')] = v
+        net.load_state_dict(new_weights)
+        # if args.continue_train:
+        #     last_epoch = checkpoint["epoch"] + 1
+        #     optimizer.load_state_dict(checkpoint["optimizer"])
+        #     aux_optimizer.load_state_dict(checkpoint["aux_optimizer"])
+        #     lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+    net = net.to(device)
+
+    if args.cuda and torch.cuda.device_count() > 1:
+        net = CustomDataParallel(net)
 
     best_loss = float("inf")
 
@@ -427,9 +489,10 @@ def main(argv):
             args.clip_max_norm,
             scaler,
             args.use_mixed_precision,
-            type
+            type,
+            args = args
         )
-        loss = test_epoch(epoch, test_dataloader, net, criterion, type)
+        loss = test_epoch(epoch, test_dataloader, net, criterion, type, args = args)
         writer.add_scalar('test_loss', loss, epoch)
         lr_scheduler.step()
 

@@ -18,6 +18,10 @@ import matplotlib.pyplot as plt
 import argparse
 import random
 
+# import pillow_heif
+
+# pillow_heif.register_heif_opener()
+
 class LICDataset(torch.utils.data.Dataset):
     def __init__(self, path, ref_path, transform=None, device='cuda', batch_size=1000, cache_size=1024, feature_cache_path=None, n_clusters=None, n_refs=1):
         self.path = path
@@ -39,8 +43,14 @@ class LICDataset(torch.utils.data.Dataset):
         self.feature_extractor = self.feature_extractor.to(device)
         self.feature_extractor.eval()
 
-        with h5py.File(path, 'r') as f:
-            self.keys = list(f.keys())
+        if os.path.isdir(path):
+            self.keys = [f for f in os.listdir(path) if f.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif'))]
+
+        elif path.endswith('.h5') or path.endswith('.hdf5'):
+            with h5py.File(path, 'r') as f:
+                self.keys = list(f.keys())
+        else:
+            raise ValueError("path must be either a directory or an HDF5 file")
         self.len = len(self.keys)
 
         self.ref_data, self.ref_keys = self.load_ref_data(ref_path)
@@ -63,7 +73,7 @@ class LICDataset(torch.utils.data.Dataset):
             ref_data = {}
             ref_keys = []
             for filename in os.listdir(ref_path):
-                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif')):
+                if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.tiff', '.bmp', '.gif', '.webp', '.heic')):
                     img_path = os.path.join(ref_path, filename)
                     ref_data[filename] = img_path
                     ref_keys.append(filename)
@@ -83,6 +93,8 @@ class LICDataset(torch.utils.data.Dataset):
                 return pickle.load(f)
         else:
             print("Computing features...")
+            directory = os.path.dirname(self.feature_cache_path)
+            os.makedirs(directory, exist_ok=True)
             features, feature_to_key = self.precompute_features()
             if self.feature_cache_path:
                 print("Saving computed features...")
@@ -138,13 +150,11 @@ class LICDataset(torch.utils.data.Dataset):
         # 获取样本 key
         key = self.keys[idx]
         sample = self.get_data(key)
-
-        # 如果样本是灰度图或单通道图像，扩展为三通道
         if len(sample.shape) == 2:
             sample = np.stack([sample] * 3, axis=-1)
         elif sample.shape[2] == 1:
             sample = np.concatenate([sample] * 3, axis=-1)
-
+        
         # 提取样本特征
         sample_feature = self.extract_feature(sample)
 
@@ -158,23 +168,14 @@ class LICDataset(torch.utils.data.Dataset):
                 with Image.open(self.ref_data[ref_key]) as img:
                     ref_sample = np.array(img)
             else:
-                ref_sample = self.ref_data[ref_key][()]
-
-            # 如果参考样本是灰度图或单通道图像，扩展为三通道
-            if len(ref_sample.shape) == 2:
-                ref_sample = np.stack([ref_sample] * 3, axis=-1)
-            elif ref_sample.shape[2] == 1:
-                ref_sample = np.concatenate([ref_sample] * 3, axis=-1)
-
-            # 将 ref_sample 添加到列表中，稍后进行 transform
+                ref_sample = self.ref_data[ref_key][:]
             ref_samples.append(ref_sample)
 
-        # 现在对 sample 和 ref_samples 应用 transform：
-        sample = Image.fromarray(np.uint8(sample))  # 转换为 PIL 图像
-        sample = self.transform(sample)  # 应用 transform
+        # 将 sample 转换为 torch.Tensor 并归一化
+        sample = self.normalize_to_tensor(sample)
 
-        # 对所有参考样本进行 transform
-        ref_samples = [self.transform(Image.fromarray(np.uint8(ref_sample))) for ref_sample in ref_samples]
+        # 对 ref_samples 列表中的每个参考样本进行转换和归一化
+        ref_samples = [self.normalize_to_tensor(ref_sample) for ref_sample in ref_samples]
 
         return sample, ref_samples, key, ref_keys
 
@@ -193,10 +194,16 @@ class LICDataset(torch.utils.data.Dataset):
             raise ValueError("Input image should be a numpy array.")
 
     def _get_data(self, key):
-        if not hasattr(self.local, 'data'):
-            self.local.data = h5py.File(self.path, 'r')
-        return self.local.data[key][()]
-
+        if os.path.isdir(self.path):
+            img_path = os.path.join(self.path, key)
+            with Image.open(img_path) as img:
+                img = np.array(img)
+            return img
+        elif self.path.endswith('.h5') or self.path.endswith('.hdf5'):
+            if not hasattr(self.local, 'data'):
+                self.local.data = h5py.File(self.path, 'r')
+            return self.local.data[key][()]
+        
     def precompute_features(self):
         features = []
         feature_to_key = {}
@@ -253,37 +260,84 @@ class LICDataset(torch.utils.data.Dataset):
         # 返回特征，去除 batch 维度并转换为 CPU 上的 numpy 数组
         return feature.squeeze().cpu().numpy()
 
-    def visualize_comparison(self, idx, save_path):
-        sample, ref_samples, sample_key, ref_keys = self[idx]
+    def retrieve_similar_images(self, query_img_path, n_refs=None, save_visualization=None):
+        """
+        给定一张图片路径，检索最相似的图片
         
-        fig, axes = plt.subplots(1, 1 + len(ref_samples), figsize=(5 * (1 + len(ref_samples)), 5))
+        Args:
+            query_img_path: 查询图片路径
+            n_refs: 返回的相似图片数量，如果为None则使用初始化时的n_refs
+            save_visualization: 可视化结果保存路径，如果为None则不保存
+            
+        Returns:
+            similar_images: 包含相似图片的列表
+            similar_keys: 相似图片对应的键名列表
+        """
+        n_refs = n_refs or self.n_refs
         
-        axes[0].imshow(sample)
-        axes[0].set_title(f'Original Image\n{sample_key}')
+        # 读取查询图片
+        with Image.open(query_img_path) as img:
+            query_img = np.array(img)
+        
+        # 提取特征
+        query_feature = self.extract_feature(query_img)
+        
+        # 最近邻搜索
+        _, indices = self.nn_searcher.kneighbors(query_feature.reshape(1, -1))
+        similar_keys = [self.feature_to_key[i] for i in indices[0]]
+        
+        # 获取相似图片
+        similar_images = []
+        for key in similar_keys:
+            if isinstance(self.ref_data, dict):
+                with Image.open(self.ref_data[key]) as img:
+                    similar_images.append(np.array(img))
+            else:
+                similar_images.append(self.ref_data[key][:])
+        
+        # 如果需要可视化结果
+        if save_visualization:
+            self._visualize_retrieval(query_img_path, similar_images, similar_keys, save_visualization)
+        
+        return similar_images, similar_keys
+    
+    def _visualize_retrieval(self, query_path, similar_images, similar_keys, save_path):
+        """
+        可视化检索结果
+        
+        Args:
+            query_path: 查询图片路径
+            similar_images: 相似图片列表
+            similar_keys: 相似图片键名列表
+            save_path: 保存路径
+        """
+        n_images = 1 + len(similar_images)
+        fig, axes = plt.subplots(1, n_images, figsize=(5 * n_images, 5))
+        
+        # 显示查询图片
+        query_img = Image.open(query_path)
+        axes[0].imshow(query_img)
+        axes[0].set_title('Query Image')
         axes[0].axis('off')
         
-        for i, (ref_sample, ref_key) in enumerate(zip(ref_samples, ref_keys), 1):
-            axes[i].imshow(ref_sample)
-            axes[i].set_title(f'Reference Image {i}\n{ref_key}')
+        # 显示相似图片
+        for i, (img, key) in enumerate(zip(similar_images, similar_keys), 1):
+            axes[i].imshow(img)
+            axes[i].set_title(f'Similar Image {i}\n{key}')
             axes[i].axis('off')
         
         plt.tight_layout()
         plt.savefig(save_path)
         plt.close()
         
-        print(f"Comparison saved to {save_path}")
+        print(f"Visualization saved to {save_path}")
 
-    def batch_visualize(self, indices, save_dir):
-        os.makedirs(save_dir, exist_ok=True)
-        for idx in indices:
-            save_path = os.path.join(save_dir, f'comparison_{idx}.png')
-            self.visualize_comparison(idx, save_path)
 
-    def __del__(self):
-        if hasattr(self.local, 'data'):
-            self.local.data.close()
-        if isinstance(self.ref_data, h5py.File):
-            self.ref_data.close()
+    # def __del__(self):
+    #     # if hasattr(self.local, 'data'):
+    #     #     self.local.data.close()
+    #     if isinstance(self.ref_data, h5py.File):
+    #         self.ref_data.close()
 
 def get_output_dir(base_dir, n_clusters, n_refs):
     return os.path.join(base_dir, f"clusters_{n_clusters}_refs_{n_refs}")
@@ -332,15 +386,136 @@ def main(args):
     print(f"Sample shape: {sample.shape}")
     print(f"Reference sample shapes: {[ref.shape for ref in ref_samples]}")
 
+def test_dataset_for_missing_values(dataset):
+    """
+    测试数据集中是否存在缺失值
+    """
+    print("开始测试数据集...")
+    
+    # 测试样本数量
+    test_size = min(100, len(dataset))  # 测试前100个样本或整个数据集
+    # test_size = len(dataset)
+    errors = []
+    
+    # 1. 测试keys是否存在
+    print(f"\n1. 测试数据集keys...")
+    if not dataset.keys:
+        errors.append("数据集keys列表为空")
+    else:
+        print(f"数据集包含 {len(dataset.keys)} 个样本")
+    
+    # 2. 测试参考数据
+    print("\n2. 测试参考数据...")
+    if isinstance(dataset.ref_data, dict):
+        missing_refs = [k for k in dataset.ref_keys if k not in dataset.ref_data]
+        if missing_refs:
+            errors.append(f"参考数据中缺失以下keys: {missing_refs}")
+    
+    # 3. 测试特征数据
+    print("\n3. 测试特征数据...")
+    if dataset.ref_features is None:
+        errors.append("特征数据为空")
+    else:
+        # 检查特征向量是否包含NaN值
+        if np.any(np.isnan(dataset.ref_features)):
+            errors.append("特征向量中存在NaN值")
+        # 检查特征向量是否包含无穷大值
+        if np.any(np.isinf(dataset.ref_features)):
+            errors.append("特征向量中存在无穷大值")
+    
+    # 4. 测试数据加载
+    print("\n4. 测试数据加载...")
+    for idx in tqdm(range(test_size), desc="测试样本加载"):
+        try:
+            # 测试数据加载
+            sample, ref_samples, key, ref_keys = dataset[idx]
+            
+            # 检查样本数据
+            if sample is None:
+                errors.append(f"样本 {idx} (key: {key}) 为空")
+            elif torch.isnan(sample).any():
+                errors.append(f"样本 {idx} (key: {key}) 包含NaN值")
+                
+            # 检查参考样本
+            for i, ref_sample in enumerate(ref_samples):
+                if ref_sample is None:
+                    errors.append(f"样本 {idx} 的参考样本 {i} 为空")
+                elif torch.isnan(ref_sample).any():
+                    errors.append(f"样本 {idx} 的参考样本 {i} 包含NaN值")
+                    
+            # 检查图像尺寸是否符合patch_size要求
+            if sample.shape[-2:] != (256, 256):
+                errors.append(f"样本 {idx} 尺寸不符合要求: {sample.shape}")
+            
+        except Exception as e:
+            errors.append(f"处理样本 {idx} 时发生错误: {str(e)}")
+    
+    # 5. 输出测试结果
+    print("\n=== 测试结果 ===")
+    if errors:
+        print("发现以下问题：")
+        for error in errors:
+            print(f"- {error}")
+    else:
+        print("未发现任何缺失值或异常")
+    
+    return len(errors) == 0
+
+
+
+
+# 使用示例
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Process dataset and visualize comparisons.')
-    parser.add_argument('--data_path', type=str, default='/img_video/img/Flicker2W.hdf5', help='Path to the main dataset')
-    parser.add_argument('--ref_path', type=str, default='/img_video/img/Flicker2K.hdf5', help='Path to the reference dataset')
-    parser.add_argument('--feature_cache_path', type=str, default='/h3cstore_ns/ydchen/code/CompressAI/data_cluster_feature/flicker_features.pkl', help='Path to feature cache')
-    parser.add_argument('--output_base_dir', type=str, default='/h3cstore_ns/ydchen/code/CompressAI/data_cluster_feature/comparison_results', help='Base output directory for results')
-    parser.add_argument('--n_clusters', type=int, default=1000, help='Number of clusters')
-    parser.add_argument('--n_refs', type=int, default=3, help='Number of reference images')
-    parser.add_argument('--num_comparisons', type=int, default=10, help='Number of comparisons to visualize')
+    parser = argparse.ArgumentParser(description='测试数据集是否存在缺失值.')
+    parser.add_argument('--data_path', type=str, 
+                       default='/h3cstore_ns/ydchen/DATASET/kodak.hdf5', 
+                       help='主数据集路径')
+    parser.add_argument('--ref_path', type=str, 
+                       default='/h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/Flickr2K.hdf5', 
+                       help='参考数据集路径')
+    parser.add_argument('--feature_cache_path', type=str, 
+                       default='/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/model_ckpt_TCM/data_cluster_feature/flicker_features.pkl', 
+                       help='特征缓存路径')
+    parser.add_argument('--n_clusters', type=int, default=3000, help='聚类数量')
+    parser.add_argument('--n_refs', type=int, default=3, help='参考图像数量')
+    parser.add_argument('--batch_size', type=int, default=32, help='批次大小')
+    parser.add_argument('--patch_size', type=int, nargs=2, default=[256, 256], help='图片块大小')
+    parser.add_argument('--cuda', action='store_true', help='是否使用CUDA')
+    parser.add_argument('--num_workers', type=int, default=0, help='数据加载的工作进程数')
+    parser.add_argument('--query_image', type=str, default='/h3cstore_ns/ydchen/DATASET/kodak/kodim05.png', help='用于测试图片检索的查询图片路径')
 
     args = parser.parse_args()
-    main(args)
+    
+    # 设置设备
+    device = 'cuda' if args.cuda and torch.cuda.is_available() else 'cpu'
+    
+    # 初始化数据集
+    transform = transforms.Compose([
+        transforms.Resize(args.patch_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    dataset = LICDataset(
+        path=args.data_path,
+        ref_path=args.ref_path,
+        transform=transform,
+        device=device,
+        batch_size=args.batch_size,
+        feature_cache_path=args.feature_cache_path,
+        n_clusters=args.n_clusters,
+        n_refs=args.n_refs
+    )
+    
+    # 运行测试
+    # test_result = test_dataset_for_missing_values(dataset)
+    # print(f"\n测试{'通过' if test_result else '失败'}")
+    if args.query_image:
+        print("\nTesting image retrieval:")
+        similar_images, similar_keys = dataset.retrieve_similar_images(
+            args.query_image,
+            n_refs=args.n_refs,
+            save_visualization=os.path.join('/h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/CLC_trained_model_1224', 'retrieval_result.png')
+        )
+        print(f"Found {len(similar_images)} similar images")
+        print(f"Similar image keys: {similar_keys}")
