@@ -2,7 +2,7 @@
 
 This repository provides the official PyTorch implementation of the paper:
 
-> **Conditional Latent Coding with Learnable Synthesized Reference for Deep Image Compression, AAAI25(oral)**  
+> **Conditional Latent Coding with Learnable Synthesized Reference for Deep Image Compression, AAAI25 (oral)**  
 > Siqi Wu†, Yinda Chen†, Dong Liu, Zhihai He\*
 >
 > † Equal contribution
