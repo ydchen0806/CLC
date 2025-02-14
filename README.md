@@ -11,7 +11,7 @@ This repository provides the official PyTorch implementation of the paper:
 ![The pipeline of our proposed methods](fig/clc3.png)
 
 ## 📢 News & Updates
-- **2025.02.14** 🤗 All pre-trained checkpoints released on [Hugging Face Hub](https://huggingface.co/cyd0806/CLC)!
+- **2025.02.14** 🤗 All pre-trained checkpoints released on [Hugging Face Hub](https://huggingface.co/cyd0806/CLC/tree/main)!
 - **2025.01.18** 🏆 CLC selected as **AAAI 2025 Oral Presentation** (Top 3% of submissions)!
 - **2024.12.11** 🎉 Paper accepted by **AAAI 2025**!
 - **2024.11.18** 💻 Core codebase officially open-sourced!
