@@ -15,7 +15,7 @@ This repository provides the official PyTorch implementation of the paper:
 - **2025.01.18** 🏆 CLC selected as **AAAI 2025 Oral Presentation** (Top 3% of submissions)!
 - **2024.12.11** 🎉 Paper accepted by **AAAI 2025**!
 - **2024.11.18** 💻 Core codebase officially open-sourced!
-- 
+  
 ## Introduction
 
 Conditional Latent Coding (CLC) is a deep image compression framework that leverages conditional coding with learnable synthesized references to achieve efficient compression. This method is built upon [CompressAI](https://github.com/InterDigitalInc/CompressAI) and the [TCM](https://github.com/jmliu206/LIC_TCM) framework.
