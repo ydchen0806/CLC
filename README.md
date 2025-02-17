@@ -1,6 +1,6 @@
 # Conditional Latent Coding (CLC) for Deep Image Compression
 
-This repository provides the official PyTorch implementation of the paper:
+This repository provides the official PyTorch implementation of the [paper](https://arxiv.org/pdf/2502.09971):
 
 > **Conditional Latent Coding with Learnable Synthesized Reference for Deep Image Compression, AAAI25 (oral)**  
 > Siqi Wu†, Yinda Chen†, Dong Liu, Zhihai He\*
