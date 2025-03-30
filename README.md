@@ -200,10 +200,10 @@ Pretrained models will be provided in future updates.
 If you find this code useful in your research, please consider citing:
 
 ```bibtex
-@article{wu2023conditional,
+@article{wu2025conditional,
   title={Conditional Latent Coding with Learnable Synthesized Reference for Deep Image Compression},
   author={Wu, Siqi and Chen, Yinda and Liu, Dong and He, Zhihai},
-  journal={arXiv preprint arXiv:XXXX.XXXXX},
+  journal={arXiv preprint arXiv:2502.09971},
   year={2025}
 }
 ```
