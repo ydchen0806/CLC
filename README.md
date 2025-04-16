@@ -193,7 +193,7 @@ To evaluate the trained model, modify the `train_CLC.py` script or create a new 
 
 ## Pretrained Models
 
-Pretrained models will be provided in future updates.
+You can download the pretrained weights in this [HuggingFace Link](https://huggingface.co/cyd0806/CLC/tree/main)!
 
 ## Citation
 
