@@ -5,18 +5,21 @@ Key design: ZERO-INIT GATED RESIDUAL
     y_f = y + gate · (μ_fuse − y)
     gate = sigmoid(γ)   where γ is initialized to −3 → sigmoid(−3) ≈ 0.05
 
-This ensures:
-  - At initialization (or when refs are useless) → gate ≈ 0 → y_f ≈ y → baseline
-  - After training, gate opens when fusion helps → y_f = fused latent → coding gain
-  - Bad / adversarial references → model learns gate → 0 → no harm
-  - ref = original → y_a ≈ y → μ_fuse = α·y + (1−α)·y = y → y_f = y (correct)
+Properties:
+  - gate ≈ 0  → y_f ≈ y  (baseline, no ref influence)
+  - gate → 1  → y_f = fused  (full ref benefit)
 
-Inspired by ControlNet zero-init and residual-gating in video codecs (DCVC-HEM).
+NOTE on training noise: REMOVED.
+  Previous version added σ·ε noise during training but not inference, causing a
+  distribution shift between train and test.  The STE quantization in the main
+  model already provides sufficient stochastic regularization.  Adding extra
+  noise on y_f means the entropy model trains on a noisier distribution than
+  what it sees at test time, leading to sub-optimal rate estimation.
+  (Similar issue documented in CompressAI issue #164 and ELIC paper Sec. 3.3)
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 class CLS(nn.Module):
@@ -30,16 +33,7 @@ class CLS(nn.Module):
             nn.Conv2d(hidden, hidden, 3, padding=1), nn.GELU(),
             nn.Conv2d(hidden, channels, 1), nn.Sigmoid(),
         )
-        # σ² prediction  (for training noise / analysis)
-        self.var_net = nn.Sequential(
-            nn.Conv2d(channels * 2, hidden, 3, padding=1), nn.GELU(),
-            nn.Conv2d(hidden, hidden, 3, padding=1), nn.GELU(),
-            nn.Conv2d(hidden, channels, 1), nn.Softplus(),
-        )
-        # ── ZERO-INIT GATE ──
-        # γ initialized to −3 → sigmoid(−3) ≈ 0.047
-        # This makes gate nearly closed at init, so the model starts at baseline.
-        # During training the gate gradually opens as the model learns to use refs.
+        # Zero-init gate:  γ = −3 → sigmoid ≈ 0.047
         self.gate_logit = nn.Parameter(torch.full((1, channels, 1, 1), -3.0))
 
     def forward(self, y, y_a):
@@ -51,20 +45,14 @@ class CLS(nn.Module):
             y_f:  conditional latent  [B, C, H, W]
             info: dict for monitoring
         """
-        cat = torch.cat([y, y_a], 1)
-        alpha = self.weight_net(cat)            # spatial-adaptive weight
-        mu_fuse = alpha * y + (1 - alpha) * y_a # fused mean
+        alpha = self.weight_net(torch.cat([y, y_a], 1))   # spatial weight ∈ (0,1)
+        mu_fuse = alpha * y + (1 - alpha) * y_a            # fused mean
 
-        gate = torch.sigmoid(self.gate_logit)   # per-channel gate ∈ (0,1)
+        gate = torch.sigmoid(self.gate_logit)               # per-channel gate ∈ (0,1)
+        y_f = y + gate * (mu_fuse - y)                      # gated residual
 
-        # Gated residual: y_f = y + gate · (fused − y)
-        #   gate ≈ 0 → y_f ≈ y          (baseline, no ref influence)
-        #   gate → 1 → y_f → mu_fuse    (full ref benefit)
-        y_f = y + gate * (mu_fuse - y)
-
-        # Small training-time noise for regularization (disabled at inference)
-        if self.training:
-            sigma = torch.sqrt(self.var_net(cat) + 1e-8)
-            y_f = y_f + sigma * torch.randn_like(y_f) * 0.05
+        # No training noise — STE quantization in GRCL._slice_loop already
+        # provides the stochastic perturbation the entropy model needs.
+        # Adding extra noise here would create a train/test mismatch.
 
         return y_f, {'alpha': alpha, 'gate': gate.mean().item()}
