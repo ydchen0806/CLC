@@ -1,19 +1,23 @@
-python3 /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/train_CLC.py \
-    -d /h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/flicker2W_org.hdf5 \
-    --ref_path /h3cstore_ns/ydchen/DATASET/coding_img_cropped_2/Flickr2K.hdf5 \
-    --test_dataset /h3cstore_ns/ydchen/DATASET/kodak.hdf5 \
-    --feature_cache_path /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/model_ckpt_TCM/data_cluster_feature/flicker_features.pkl \
-    --save_path /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/clc_trained_model_final_modify_no_amp_clm_decompress \
-    --model clc \
+#!/bin/bash
+# GRCL training example — single GPU
+# Adjust paths to your environment before running.
+
+python3 train_CLC.py \
+    -m grcl \
+    -d /path/to/flickr2w.hdf5 \
+    --ref_path /path/to/flickr2k/ \
+    --test_dataset /path/to/kodak.hdf5 \
+    --feature_cache_path /path/to/feature_cache/flicker_features.pkl \
+    --save_path ./checkpoints_grcl/ \
     --lambda 0.01 \
     --epochs 50 \
-    --batch-size 80 \
+    --batch-size 8 \
     --learning-rate 1e-4 \
     --n_refs 3 \
-    --N 64 \
+    --N 128 \
     --n_clusters 3000 \
     --type mse \
     --patch-size 256 256 \
+    --lr_epoch 30 40 \
     --cuda \
-    --num-workers 0 \
-    --checkpoint /h3cstore_ns/ydchen/code/CompressAI/LIC_TCM/clc_trained_model_final_modify_no_amp/0.01checkpoint_best.pth.tar
+    --num-workers 4

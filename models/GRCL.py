@@ -229,8 +229,9 @@ class GRCL(CompressionModel):
         if refs is None:
             return None, None, None
         lats = [self.g_a(r).detach() for r in refs]
-        feat = self.ref_adapt(torch.cat(lats, 1))           # compact [B, 64, H, W]
-        combined = self.ref_combine(torch.cat(lats, 1))      # full   [B, M,  H, W]
+        cat_lats = torch.cat(lats, 1)                        # compute once, reuse
+        feat = self.ref_adapt(cat_lats)                       # compact [B, 64, H, W]
+        combined = self.ref_combine(cat_lats)                 # full   [B, M,  H, W]
         return lats, feat, combined
 
     def _clm_cls(self, y, ref_lats):
@@ -288,7 +289,7 @@ class GRCL(CompressionModel):
             else:   # decompress
                 idx = self.gaussian_conditional.build_indexes(sc)
                 rv = self._dec.decode_stream(idx.reshape(-1).tolist(), *self._cdfs)
-                rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1])
+                rv = torch.Tensor(rv).reshape(1, -1, y_shape[0], y_shape[1]).to(mu.device)
                 yh = self.gaussian_conditional.dequantize(rv, mu)
 
             # ── LRP ──────────────────────────────────────────────

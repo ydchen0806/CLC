@@ -32,7 +32,10 @@ class LICDataset(torch.utils.data.Dataset):
         self.n_clusters = n_clusters
         self.n_refs = n_refs
         
-        self.transform = transform or transforms.Compose([
+        # data_transform: applied to sample & ref output (crop + ToTensor from caller)
+        self.data_transform = transform
+        # feat_transform: fixed ResNet preprocessing for feature extraction only
+        self.transform = transforms.Compose([
             transforms.Resize((224, 224)),
             transforms.ToTensor(),
             transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
@@ -152,10 +155,10 @@ class LICDataset(torch.utils.data.Dataset):
         sample = self.get_data(key)
         if len(sample.shape) == 2:
             sample = np.stack([sample] * 3, axis=-1)
-        elif sample.shape[2] == 1:
+        elif sample.shape[-1] == 1:
             sample = np.concatenate([sample] * 3, axis=-1)
         
-        # 提取样本特征
+        # 提取样本特征 (uses self.transform = ResNet preprocessing)
         sample_feature = self.extract_feature(sample)
 
         # 最近邻搜索匹配参考样本的 key
@@ -166,16 +169,31 @@ class LICDataset(torch.utils.data.Dataset):
         for ref_key in ref_keys:
             if isinstance(self.ref_data, dict):
                 with Image.open(self.ref_data[ref_key]) as img:
-                    ref_sample = np.array(img)
+                    ref_sample = np.array(img.convert('RGB'))
             else:
                 ref_sample = self.ref_data[ref_key][:]
+            if len(ref_sample.shape) == 2:
+                ref_sample = np.stack([ref_sample] * 3, axis=-1)
+            elif ref_sample.shape[-1] == 1:
+                ref_sample = np.concatenate([ref_sample] * 3, axis=-1)
+            elif ref_sample.shape[-1] == 4:
+                ref_sample = ref_sample[..., :3]
             ref_samples.append(ref_sample)
 
-        # 将 sample 转换为 torch.Tensor 并归一化
-        sample = self.normalize_to_tensor(sample)
-
-        # 对 ref_samples 列表中的每个参考样本进行转换和归一化
-        ref_samples = [self.normalize_to_tensor(ref_sample) for ref_sample in ref_samples]
+        # Apply data_transform (e.g. RandomCrop) if provided, else just normalize
+        if self.data_transform is not None:
+            sample_pil = Image.fromarray(np.uint8(sample))
+            sample = self.data_transform(sample_pil)         # applies crop+ToTensor
+            target_h, target_w = sample.shape[-2], sample.shape[-1]
+            processed_refs = []
+            for ref_np in ref_samples:
+                ref_pil = Image.fromarray(np.uint8(ref_np)).resize((target_w, target_h), Image.BILINEAR)
+                ref_t = transforms.ToTensor()(ref_pil)        # [C,H,W] in [0,1]
+                processed_refs.append(ref_t)
+            ref_samples = processed_refs
+        else:
+            sample = self.normalize_to_tensor(sample)
+            ref_samples = [self.normalize_to_tensor(r) for r in ref_samples]
 
         return sample, ref_samples, key, ref_keys
 

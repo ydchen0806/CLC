@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+*.pkl
+*.pth.tar
+*.tar
+checkpoints*/
+tensorboard/
+_ref_cache/
+_web_cache/
+_caption_cache/
+.vscode/
+.idea/
+

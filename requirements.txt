@@ -1,0 +1,15 @@
+torch>=1.12
+torchvision
+compressai>=1.2
+einops
+timm
+pytorch-msssim
+numpy
+scikit-learn
+h5py
+pillow
+tqdm
+tensorboard
+matplotlib
+requests
+
